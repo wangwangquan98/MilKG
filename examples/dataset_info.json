@@ -1,0 +1,8 @@
+{
+  "milkg_extractor": {
+    "file_name": "extractor_sft_alpaca.json"
+  },
+  "milkg_sft": {
+    "file_name": "sft_alpaca.json"
+  }
+}

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "milkg-qa-reproduction"
+version = "0.1.0"
+description = "Paper-grounded MilKG-QA SFT data generation pipeline"
+requires-python = ">=3.10"
+dependencies = ["networkx>=3.0"]
+
+[project.optional-dependencies]
+documents = ["pypdf>=4", "python-docx>=1"]
+test = ["pytest>=8"]
+web = ["fastapi>=0.115", "uvicorn>=0.30", "python-multipart>=0.0.9"]
+
+[project.scripts]
+milkg = "milkg.cli:main"
+milkg-web = "milkg.web:main"
+
+[tool.setuptools.packages.find]
+include = ["milkg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

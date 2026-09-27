@@ -1,0 +1,30 @@
+[
+  {
+    "chunk_id": "fictional:0000",
+    "entities": [
+      {"name": "甲武器", "type": "Weapon System", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "乙武器", "type": "Weapon System", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "丙武器", "type": "Weapon System", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "丁武器", "type": "Weapon System", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "甲平台", "type": "Platform/Carrier", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "乙平台", "type": "Platform/Carrier", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "甲单位", "type": "Combat Unit", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "甲司令部", "type": "Command Structure", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "甲行动", "type": "Campaign/Operation", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "乙行动", "type": "Campaign/Operation", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "甲参数", "type": "Technical Specification", "confidence": 0.95, "chunk_id": "fictional:0000"},
+      {"name": "乙参数", "type": "Technical Specification", "confidence": 0.95, "chunk_id": "fictional:0000"}
+    ],
+    "relations": [
+      {"source": "甲平台", "target": "甲武器", "type": "Equip-Carry", "confidence": 0.95, "evidence": "甲平台搭载甲武器", "chunk_id": "fictional:0000"},
+      {"source": "乙平台", "target": "乙武器", "type": "Equip-Carry", "confidence": 0.95, "evidence": "乙平台搭载乙武器", "chunk_id": "fictional:0000"},
+      {"source": "甲单位", "target": "甲平台", "type": "Unit-Equip", "confidence": 0.95, "evidence": "甲单位操作甲平台", "chunk_id": "fictional:0000"},
+      {"source": "甲单位", "target": "甲司令部", "type": "Unit-Org", "confidence": 0.95, "evidence": "甲单位隶属甲司令部", "chunk_id": "fictional:0000"},
+      {"source": "甲武器", "target": "乙武器", "type": "Equip-Counter", "confidence": 0.95, "evidence": "甲武器克制乙武器", "chunk_id": "fictional:0000"},
+      {"source": "甲武器", "target": "甲参数", "type": "Weapon-Spec", "confidence": 0.95, "evidence": "甲武器参数为甲参数", "chunk_id": "fictional:0000"},
+      {"source": "乙武器", "target": "乙参数", "type": "Weapon-Spec", "confidence": 0.95, "evidence": "乙武器参数为乙参数", "chunk_id": "fictional:0000"},
+      {"source": "甲行动", "target": "甲单位", "type": "Campaign-Part", "confidence": 0.95, "evidence": "甲单位参与甲行动", "chunk_id": "fictional:0000"},
+      {"source": "甲行动", "target": "乙行动", "type": "Causal-Lead", "confidence": 0.95, "evidence": "甲行动导致乙行动", "chunk_id": "fictional:0000"}
+    ]
+  }
+]
