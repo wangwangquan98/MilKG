@@ -36,11 +36,19 @@ def test_web_job_processes_upload_and_exports(tmp_path):
     manager.run(job, "secret")
     assert job.status == "completed"
     assert job.progress == 100
+    assert job.snapshot()["graph_nodes"] == 2
+    assert job.snapshot()["graph_edges"] == 1
+    assert job.snapshot()["atomic_subgraphs"] == 1
     assert job.items[0]["answer"] == "甲武器"
     assert "secret" not in (job.output_dir / "config.json").read_text(encoding="utf-8")
     assert (job.output_dir / "sft_alpaca.json").exists()
     assert (job.output_dir / "sft_sharegpt.json").exists()
     assert (job.output_dir / "sft_chatml.json").exists()
+    assert (job.output_dir / "job_state.json").exists()
+    restored = web.JobManager(tmp_path).get(job.id)
+    assert restored.status == "completed"
+    assert restored.snapshot()["item_count"] == 1
+    assert restored.snapshot()["graph_edges"] == 1
 
     original = web.manager
     web.manager = manager

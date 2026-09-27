@@ -234,6 +234,7 @@ onUnmounted(stopPolling)
           <button class="advanced-toggle" type="button" :aria-expanded="advanced" @click="advanced = !advanced"><span>高级参数</span><span>{{ advanced ? '−' : '+' }}</span></button>
           <div v-if="advanced" class="advanced-content">
             <div class="number-grid"><label>分块字符数<input v-model.number="config.max_chars" type="number" min="400" max="8000" /></label><label>重叠字符数<input v-model.number="config.overlap" type="number" min="0" max="1000" /></label><label>最多语义子图<input v-model.number="config.max_subgraphs" type="number" min="1" max="200" /></label><label>最多单跳事实<input v-model.number="config.max_atomic" type="number" min="0" max="100" /></label><label>每图生成次数<input v-model.number="config.per_subgraph" type="number" min="1" max="5" /></label><label>最低置信度<input v-model.number="config.min_confidence" type="number" min="0" max="1" step="0.05" /></label></div>
+            <p class="advanced-hint">语义子图上限只限制多关系出题素材的数量；实际数量取决于图谱中的关系。单跳事实和技术规格需要在下方分别开启。</p>
             <div class="advanced-line"><span>问答题型</span><div class="check-grid"><label v-for="(name, type) in typeNames" :key="type" class="check-option"><input v-model="config.question_types" type="checkbox" :value="type" />{{ name }}</label></div></div>
             <div class="switch-line"><label><input v-model="config.include_atomic" type="checkbox" />加入单跳事实</label><label><input v-model="config.materialize_specs" type="checkbox" />补充技术规格关系</label></div>
           </div>
@@ -245,6 +246,7 @@ onUnmounted(stopPolling)
             <div class="progress-display"><div><span class="progress-caption">CURRENT STAGE</span><h3>{{ job ? stageNames[job.stage] || '处理中' : '准备就绪' }}</h3><p>{{ job?.status === 'failed' ? job.error : job ? `${job.filename || '文档'} · ${progressLabel}` : '上传文档并设置参数，开始构建数据集。' }}</p></div><div class="progress-number">{{ job?.progress ?? 0 }}<small>%</small></div></div>
             <div class="progress-track"><div :style="{ width: `${job?.progress ?? 0}%` }"></div></div>
             <div class="milestones"><div v-for="(name, index) in stageMilestones" :key="name" :class="{ reached: currentStageIndex >= index, active: currentStageIndex === index }"><i></i><span>{{ name }}</span></div></div>
+            <div v-if="job?.graph_nodes" class="graph-metrics"><span><b>{{ job.graph_nodes }}</b> 节点</span><span><b>{{ job.graph_edges }}</b> 关系边</span><span><b>{{ job.semantic_subgraphs }}</b> 语义子图</span><span><b>{{ job.atomic_subgraphs }}</b> 单跳事实</span></div>
           </div>
 
           <div class="panel log-panel"><div class="panel-heading"><div><span class="section-no">03 / ACTIVITY</span><h2>运行日志</h2></div><span class="log-count">{{ job?.logs?.length || 0 }} EVENTS</span></div>

@@ -106,6 +106,10 @@ class Job:
     current: int = 0
     total: int = 0
     error: str | None = None
+    graph_nodes: int = 0
+    graph_edges: int = 0
+    semantic_subgraphs: int = 0
+    atomic_subgraphs: int = 0
     logs: list[dict] = field(default_factory=list)
     items: list[dict] = field(default_factory=list)
     created_at: str = field(default_factory=_now)
@@ -126,6 +130,7 @@ class Job:
             self.logs.append({"time": _now(), "level": level,
                               "stage": self.stage, "message": message})
             self.logs = self.logs[-500:]
+            _write_json(self.output_dir / "job_state.json", self.snapshot())
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -134,6 +139,9 @@ class Job:
                     "current": self.current, "total": self.total,
                     "created_at": self.created_at, "error": self.error,
                     "logs": list(self.logs), "item_count": len(self.items),
+                    "graph_nodes": self.graph_nodes, "graph_edges": self.graph_edges,
+                    "semantic_subgraphs": self.semantic_subgraphs,
+                    "atomic_subgraphs": self.atomic_subgraphs,
                     "output_format": self.config.output_format}
 
 
@@ -174,9 +182,56 @@ class JobManager:
     def get(self, job_id: str) -> Job:
         with self.lock:
             job = self.jobs.get(job_id)
+            if job is None and re.fullmatch(r"[0-9a-f]{32}", job_id):
+                job = self._restore(job_id)
+                if job is not None:
+                    self.jobs[job_id] = job
         if job is None:
             raise HTTPException(status_code=404, detail="任务不存在或服务已重启")
         return job
+
+    def _restore(self, job_id: str) -> Job | None:
+        output_dir = self.output_root / job_id
+        config_path = output_dir / "config.json"
+        if not config_path.is_file():
+            return None
+        source = next((path for path in output_dir.iterdir()
+                       if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS), None)
+        if source is None:
+            return None
+        try:
+            config = RunConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+            state_path = output_dir / "job_state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+            qa_path = output_dir / "qa.json"
+            items = json.loads(qa_path.read_text(encoding="utf-8")) if qa_path.exists() else []
+            job = Job(job_id, state.get("filename", source.name), source, output_dir, config)
+            job.items = items
+            job.created_at = state.get("created_at", job.created_at)
+            job.logs = state.get("logs", [])[-500:]
+            completed = all((output_dir / f"sft_{fmt}.json").exists() for fmt in FORMATS)
+            job.status = "completed" if completed else "failed"
+            job.stage = "completed" if completed else "failed"
+            job.progress = 100 if completed else state.get("progress", 0)
+            job.current = len(items) if completed else state.get("current", 0)
+            job.total = len(items) if completed else state.get("total", 0)
+            job.error = None if completed else "任务因服务重启而中断，请重新提交。"
+            graph_path = output_dir / "graph.json"
+            if graph_path.exists():
+                graph = MilitaryGraph.load(graph_path)
+                job.graph_nodes = graph.graph.number_of_nodes()
+                job.graph_edges = graph.graph.number_of_edges()
+            subgraphs_path = output_dir / "subgraphs.json"
+            if subgraphs_path.exists():
+                subgraphs = json.loads(subgraphs_path.read_text(encoding="utf-8"))
+                job.semantic_subgraphs = sum(s["strategy"] != "atomic_fact" for s in subgraphs)
+                job.atomic_subgraphs = len(subgraphs) - job.semantic_subgraphs
+            if not job.logs:
+                job.note("已从本地任务文件恢复运行结果。", stage=job.stage,
+                         progress=job.progress)
+            return job
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def _model(self, config: RunConfig, name: str, api_key: str, job: Job) -> CheckedModel:
         return CheckedModel(OpenAICompatibleModel(config.api_url, name, api_key,
@@ -216,14 +271,30 @@ class JobManager:
                 added = materialize_specifications(kg, chunks)
                 job.note(f"补充 {added} 条有原文证据的技术规格关系。", stage="graph", progress=60)
             kg.save(job.output_dir / "graph.json")
+            with job.lock:
+                job.graph_nodes = kg.graph.number_of_nodes()
+                job.graph_edges = kg.graph.number_of_edges()
             subgraphs = traverse(kg, max_subgraphs=config.max_subgraphs)
             semantic_count = len(subgraphs)
             if config.include_atomic:
                 subgraphs.extend(atomic_facts(kg)[:config.max_atomic])
+            with job.lock:
+                job.semantic_subgraphs = semantic_count
+                job.atomic_subgraphs = len(subgraphs) - semantic_count
             _write_json(job.output_dir / "subgraphs.json", [subgraph.to_dict() for subgraph in subgraphs])
             job.note(f"遍历完成：{semantic_count} 个语义子图，"
                      f"{len(subgraphs) - semantic_count} 个单跳事实。",
                      stage="traversing", progress=65, current=0, total=len(subgraphs))
+            if config.max_subgraphs > 1 and semantic_count <= 1:
+                advice = []
+                if not config.materialize_specs:
+                    advice.append("可尝试开启“补充技术规格关系”")
+                if not config.include_atomic:
+                    advice.append("可尝试开启“加入单跳事实”")
+                hint = "；".join(advice)
+                job.note(f"图谱有 {job.graph_nodes} 个节点、{job.graph_edges} 条关系边；"
+                         f"仅找到 {semantic_count} 个语义子图。“最多语义子图”是上限，"
+                         f"不会补齐缺少的关系。{hint}", level="warning", stage="traversing")
             if subgraphs:
                 generator = self._model(config, config.generate_model, api_key, job)
                 last_accepted = 0
