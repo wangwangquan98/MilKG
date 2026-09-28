@@ -22,7 +22,39 @@ supporting_facts 是所用边 ID 数组；referenced_entities 是问题和答案
 answer_entities 是答案所指实体 ID 数组。所有 ID 必须来自输入。CoT 必须逐步解释至少两条事实。
 真假题 answer 只能是“正确”或“错误”；当要求错误题时，还必须输出
 altered_fact={"edge_id":原边ID,"replacement_node_id":替换目标实体ID}，将原边目标换成同类型、不同且图中无该关系的实体。
-题干和解释不要引入子图外的事实；干扰选项可用给出的同类型已知实体，不得与正确选项等价。"""
+题干和解释不要引入子图外的事实；干扰选项可用给出的同类型已知实体，不得与正确选项等价。
+question、options、answer、explanation 将直接用于训练没有图谱输入的模型，必须独立可读。
+解释要直接写出所依据的人物、装备、关系和必要的数值，不能写“根据子图/图谱/给定资料/事实编号”、
+“图中没有证据”等依赖外部上下文的话，也不能出现 e000001、n000001 等内部 ID。
+内部 ID 只允许出现在 supporting_facts、referenced_entities、answer_entities、altered_fact 字段。
+选择题的解释只说明正确选项成立的正面事实，不评论错误选项；不能把“子图未收录”当作错误依据。"""
+
+REWRITE_SYSTEM = """把候选问答改写成可直接用于训练的独立问答。只使用给出的事实，不补充常识。
+只返回 JSON 对象，包含 question、options、answer、explanation 四个字段；题型、正确答案和选项含义不变。
+题干、选项、答案、解释必须自足：直接陈述具体事实，不能提子图、图谱、资料、事实编号、实体编号、
+内部 ID 或“图中未证实”。选择题只解释正确选项，不提错误选项；其他题也只陈述答案所需的正面事实。"""
+
+_INTERNAL_ID = re.compile(r"(?<![A-Za-z0-9_])[en]\d{4,}(?![A-Za-z0-9_])", re.I)
+_EXTERNAL_CONTEXT = re.compile(
+    r"子图|知识图谱|图谱|(?:给定|所给|提供|上述)(?:的)?(?:资料|材料|信息)|"
+    r"(?:给定|所给|提供)(?:的)?事实|事实编号|实体编号|边编号|"
+    r"(?:实体|边|事实)\s*ID|属性信息|未被证实|(?:图|表|文)中", re.I
+)
+
+
+def training_text_issue(item: dict) -> str | None:
+    """Check only fields visible to the future model, not provenance fields."""
+    fields = [item.get("question"), item.get("explanation"), item.get("answer")]
+    options = item.get("options") or []
+    if not isinstance(options, list):
+        return "invalid options"
+    fields.extend(option.get("text") for option in options if isinstance(option, dict))
+    for value in fields:
+        values = value if isinstance(value, list) else [value]
+        for part in values:
+            if isinstance(part, str) and (_INTERNAL_ID.search(part) or _EXTERNAL_CONTEXT.search(part)):
+                return "graph reference in training text"
+    return None
 
 
 def difficulty(depth: int) -> str:
@@ -76,6 +108,11 @@ def validate_qa(raw: dict, kg: MilitaryGraph, subgraph: Subgraph,
     question, answer = raw.get("question"), raw.get("answer")
     if not isinstance(question, str) or not question.strip():
         return False, "missing question"
+    if not isinstance(raw.get("explanation"), str) or not raw["explanation"].strip():
+        return False, "missing explanation"
+    issue = training_text_issue(raw)
+    if issue:
+        return False, issue
     if len(question + str(answer)) < 10 or len(question + str(answer)) > 2000:
         return False, "length outside [10,2000]"
     supporting = raw.get("supporting_facts")
@@ -131,6 +168,10 @@ def validate_qa(raw: dict, kg: MilitaryGraph, subgraph: Subgraph,
                                                        for node in answer_entities
                                                        for name in _names(kg, node)):
                 return False, "distractor equals correct entity"
+        explanation = normalize_name(raw["explanation"])
+        if any(normalize_name(option["text"]) in explanation
+               for option in options if option["label"] not in answer):
+            return False, "explanation discusses distractor"
     else:
         if options not in ([], None):
             return False, "non-choice question has options"
@@ -228,6 +269,26 @@ def generate_qa(kg: MilitaryGraph, subgraphs: list[Subgraph], model: ChatModel,
                     on_progress(accepted, stats)
                 continue
             valid, reason = validate_qa(raw, kg, subgraph, question_type, truth)
+            if not valid and reason in {"graph reference in training text",
+                                        "explanation discusses distractor"}:
+                try:
+                    rewrite_prompt = (generation_prompt(kg, subgraph, question_type, style, truth)
+                                      + "\n待改写候选：\n"
+                                      + json.dumps(raw, ensure_ascii=False))
+                    rewritten = model.complete(REWRITE_SYSTEM, rewrite_prompt, temperature)
+                    if isinstance(rewritten, dict):
+                        candidate = {**raw, **{key: rewritten[key]
+                                              for key in ("question", "explanation")
+                                              if key in rewritten}}
+                        if training_text_issue(candidate):
+                            candidate.update({key: rewritten[key]
+                                              for key in ("options", "answer") if key in rewritten})
+                        valid, reason = validate_qa(candidate, kg, subgraph, question_type, truth)
+                        if valid:
+                            raw = candidate
+                            stats["rewritten"] = stats.get("rewritten", 0) + 1
+                except (RuntimeError, ValueError, TimeoutError):
+                    pass
             if not valid:
                 stats["invalid"] += 1
                 stats[f"invalid:{reason}"] = stats.get(f"invalid:{reason}", 0) + 1
@@ -262,6 +323,9 @@ def export_sft(items: list[dict], path: Path, fmt: str = "alpaca") -> None:
         raise ValueError(f"Unknown output format: {fmt}")
     result = []
     for item in items:
+        issue = training_text_issue(item)
+        if issue:
+            raise ValueError(f"Cannot export SFT item with {issue}: {item.get('question', '')[:80]}")
         options = item.get("options") or []
         instruction = item["question"]
         if options:
@@ -275,6 +339,5 @@ def export_sft(items: list[dict], path: Path, fmt: str = "alpaca") -> None:
         else:
             record = {"messages": [{"role": "user", "content": instruction},
                                    {"role": "assistant", "content": response}]}
-        record["metadata"] = {k: item[k] for k in ("type", "style", "difficulty", "strategy", "supporting_facts")}
         result.append(record)
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

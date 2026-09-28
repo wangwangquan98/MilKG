@@ -199,12 +199,70 @@ def test_qa_validation_and_export(tmp_path):
     assert validate_qa(raw, kg, subgraph, "single_choice")[0]
     bad = {**raw, "options": [raw["options"][0]] * 4}
     assert not validate_qa(bad, kg, subgraph, "single_choice")[0]
+    distractor_claim = {**raw, "explanation": "甲平台搭载甲武器，乙武器不是其装备。"}
+    assert validate_qa(distractor_claim, kg, subgraph, "single_choice")[1] == "explanation discusses distractor"
     item = {**raw, "type": "single_choice", "style": "formal_exam",
             "difficulty": "easy", "strategy": "test"}
     path = tmp_path / "sft.json"
     export_sft([item], path, "alpaca")
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved[0]["output"].startswith("A")
+    assert set(saved[0]) == {"instruction", "input", "output"}
+    export_sft([item], path, "sharegpt")
+    assert set(json.loads(path.read_text(encoding="utf-8"))[0]) == {"conversations"}
+    export_sft([item], path, "chatml")
+    assert set(json.loads(path.read_text(encoding="utf-8"))[0]) == {"messages"}
+
+
+def test_training_text_rejects_internal_ids_and_external_context(tmp_path):
+    kg = fixture_graph()
+    edge = next(kg.edges("Equip-Carry"))
+    subgraph = Subgraph("test", (edge[0], edge[1]), (edge[2],), 1)
+    base = {"question": "甲平台所搭载的武器是哪一项？", "options": [
+        {"label": "A", "text": "甲武器"}, {"label": "B", "text": "乙武器"},
+        {"label": "C", "text": "丙武器"}, {"label": "D", "text": "丁武器"}],
+        "answer": ["A"], "explanation": "甲平台搭载甲武器。",
+        "supporting_facts": [edge[2]], "referenced_entities": [edge[0], edge[1]],
+        "answer_entities": [edge[1]]}
+    for changed in ({"explanation": f"根据子图事实{edge[2]}，甲平台搭载甲武器。"},
+                    {"question": "根据给定资料，甲平台搭载哪种武器？"},
+                    {"options": [{**base["options"][0], "text": "甲武器（n000001）"},
+                                 *base["options"][1:]]}):
+        item = {**base, **changed}
+        assert validate_qa(item, kg, subgraph, "single_choice")[1] == "graph reference in training text"
+        path = tmp_path / "sft.json"
+        try:
+            export_sft([item], path)
+            assert False, "leaking record should not be exported"
+        except ValueError:
+            assert not path.exists()
+
+
+def test_generation_rewrites_graph_references_before_accepting():
+    kg = fixture_graph()
+    edge = next(kg.edges("Equip-Carry"))
+    subgraph = Subgraph("test", (edge[0], edge[1]), (edge[2],), 1)
+
+    class RewritingModel:
+        calls = 0
+
+        def complete(self, system, user, temperature):
+            self.calls += 1
+            if self.calls == 1:
+                return {"question": "甲平台所搭载的武器是哪一项？", "options": [
+                    {"label": "A", "text": "甲武器"}, {"label": "B", "text": "乙武器"},
+                    {"label": "C", "text": "丙武器"}, {"label": "D", "text": "丁武器"}],
+                    "answer": ["A"], "explanation": f"根据子图事实{edge[2]}，甲平台搭载甲武器。",
+                    "supporting_facts": [edge[2]], "referenced_entities": [edge[0], edge[1]],
+                    "answer_entities": [edge[1]]}
+            assert "独立问答" in system
+            return {"question": "甲平台所搭载的武器是哪一项？", "explanation": "甲平台搭载甲武器。"}
+
+    model = RewritingModel()
+    items, stats = generate_qa(kg, [subgraph], model, ("single_choice",))
+    assert model.calls == 2
+    assert stats["accepted"] == stats["rewritten"] == 1
+    assert items[0]["explanation"] == "甲平台搭载甲武器。"
 
 
 def test_chunking_and_chinese_rouge():
