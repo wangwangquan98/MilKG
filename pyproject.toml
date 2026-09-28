@@ -13,6 +13,7 @@ dependencies = ["networkx>=3.0"]
 documents = ["pypdf>=4", "python-docx>=1"]
 test = ["pytest>=8"]
 web = ["fastapi>=0.115", "uvicorn>=0.30", "python-multipart>=0.0.9"]
+neo4j = ["neo4j>=5.28,<7"]
 
 [project.scripts]
 milkg = "milkg.cli:main"

@@ -2,6 +2,7 @@
 
 import json
 import re
+from copy import deepcopy
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -116,8 +117,8 @@ class MilitaryGraph:
         return None
 
     def to_dict(self) -> dict:
-        return {"nodes": [{"id": node, **data} for node, data in self.graph.nodes(data=True)],
-                "edges": [{"source": s, "target": t, **data} for s, t, _, data in self.edges()]}
+        return {"nodes": [{"id": node, **deepcopy(data)} for node, data in self.graph.nodes(data=True)],
+                "edges": [{"source": s, "target": t, **deepcopy(data)} for s, t, _, data in self.edges()]}
 
     @classmethod
     def from_dict(cls, raw: dict, synonyms: dict[str, str] | None = None) -> "MilitaryGraph":

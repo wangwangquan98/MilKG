@@ -1,6 +1,6 @@
 import json
 
-from milkg.documents import Chunk, chunk_text, preprocess_text
+from milkg.documents import Chunk, chunk_text, load_chunks, preprocess_text
 from milkg.extraction import RELATION_GUIDANCE, extract_chunk, validate_extraction
 from milkg.graph import MilitaryGraph
 from milkg.ontology import ENTITY_TYPES, RELATIONS
@@ -72,6 +72,18 @@ def test_long_ocr_paragraph_splits_at_sentence_boundaries():
     chunks = chunk_text(text, "long.txt", 120, 20)
     assert len(chunks) > 1
     assert all(len(chunk.text) <= 120 and chunk.text.endswith("。") for chunk in chunks)
+
+
+def test_document_chunk_ids_use_stable_content_hash(tmp_path):
+    first, second = tmp_path / "one" / "same.txt", tmp_path / "two" / "same.txt"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("甲平台搭载甲武器。", encoding="utf-8")
+    second.write_text("乙平台搭载乙武器。", encoding="utf-8")
+    one, two = load_chunks([first])[0], load_chunks([second])[0]
+    assert one.id == load_chunks([first])[0].id
+    assert one.id != two.id
+    assert one.id.split(":", 1)[0] != two.id.split(":", 1)[0]
 
 
 def test_relation_review_recovers_ocr_spaced_evidence():

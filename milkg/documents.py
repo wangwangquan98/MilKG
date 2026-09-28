@@ -1,5 +1,6 @@
 """Read supported documents and chunk at document/paragraph boundaries."""
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,5 +104,7 @@ def load_chunks(paths: list[Path], max_chars: int = 1800, overlap: int = 180) ->
         files.extend(sorted(p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}) if path.is_dir() else [path])
     chunks: list[Chunk] = []
     for path in files:
-        chunks.extend(chunk_text(read_document(path), str(path), max_chars, overlap))
+        document_id = hashlib.sha256(path.read_bytes()).hexdigest()[:20]
+        chunks.extend(Chunk(f"{document_id}:{chunk.id}", chunk.source, chunk.text)
+                      for chunk in chunk_text(read_document(path), str(path), max_chars, overlap))
     return chunks

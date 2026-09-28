@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -23,6 +24,7 @@ from .documents import load_chunks
 from .extraction import extract_chunk
 from .graph import MilitaryGraph
 from .llm import ChatModel, OpenAICompatibleModel
+from .neo4j_store import Neo4jGraphStore, document_rows
 from .qa import QUESTION_TYPES, export_sft, generate_qa
 from .traversal import atomic_facts, traverse
 
@@ -55,6 +57,14 @@ def _write_json(path: Path, value: object) -> None:
 
 
 class RunConfig(BaseModel):
+    mode: Literal["run", "build", "generate"] = "run"
+    storage: Literal["json", "neo4j"] = "json"
+    graph_action: Literal["new", "extend"] = "new"
+    graph_id: str | None = None
+    graph_name: str = Field(default="MilKG", max_length=120)
+    neo4j_uri: str = "bolt://127.0.0.1:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_database: str = "neo4j"
     api_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     extract_model: str = Field(default="qwen3.5-flash", min_length=1, max_length=100)
     generate_model: str = Field(default="qwen3.5-plus", min_length=1, max_length=100)
@@ -101,6 +111,18 @@ class RunConfig(BaseModel):
     def valid_chunk_window(self) -> "RunConfig":
         if self.overlap >= self.max_chars:
             raise ValueError("分块重叠量必须小于块长")
+        if self.mode == "generate" and self.storage != "neo4j":
+            raise ValueError("WebUI 的独立生成模式需要 Neo4j 图谱")
+        if (self.mode == "generate" or self.graph_action == "extend") and self.storage == "neo4j" and not self.graph_id:
+            raise ValueError("请选择已有的 Neo4j 图谱")
+        if self.graph_action == "extend" and self.storage != "neo4j":
+            raise ValueError("WebUI 的扩展图谱模式需要 Neo4j")
+        if self.storage == "neo4j":
+            parsed = urlparse(self.neo4j_uri)
+            if parsed.scheme not in {"bolt", "bolt+s", "bolt+ssc", "neo4j", "neo4j+s", "neo4j+ssc"}:
+                raise ValueError("Neo4j 地址须使用 bolt:// 或 neo4j:// 协议")
+            if parsed.username or parsed.password:
+                raise ValueError("Neo4j 地址中不要包含用户名或密码，请使用单独的输入框")
         return self
 
 
@@ -108,7 +130,7 @@ class RunConfig(BaseModel):
 class Job:
     id: str
     filename: str
-    source_path: Path
+    source_path: Path | None
     output_dir: Path
     config: RunConfig
     status: str = "queued"
@@ -119,6 +141,7 @@ class Job:
     error: str | None = None
     graph_nodes: int = 0
     graph_edges: int = 0
+    graph_id: str | None = None
     semantic_subgraphs: int = 0
     atomic_subgraphs: int = 0
     logs: list[dict] = field(default_factory=list)
@@ -151,6 +174,8 @@ class Job:
                     "created_at": self.created_at, "error": self.error,
                     "logs": list(self.logs), "item_count": len(self.items),
                     "graph_nodes": self.graph_nodes, "graph_edges": self.graph_edges,
+                    "graph_id": self.graph_id or self.config.graph_id,
+                    "mode": self.config.mode, "storage": self.config.storage,
                     "semantic_subgraphs": self.semantic_subgraphs,
                     "atomic_subgraphs": self.atomic_subgraphs,
                     "output_format": self.config.output_format}
@@ -173,21 +198,23 @@ class JobManager:
         self.lock = threading.RLock()
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="milkg-job")
 
-    def create(self, filename: str, content: bytes, config: RunConfig,
-               api_key: str, start: bool = True) -> Job:
+    def create(self, filename: str, content: bytes | None, config: RunConfig,
+               api_key: str, start: bool = True, neo4j_password: str = "") -> Job:
         job_id = uuid.uuid4().hex
         output_dir = self.output_root / job_id
         output_dir.mkdir(parents=True)
-        safe_name = re.sub(r"[^\w.\-]", "_", filename, flags=re.UNICODE).strip("._") or "document.txt"
-        source_path = output_dir / safe_name
-        source_path.write_bytes(content)
+        source_path = None
+        if content is not None:
+            safe_name = re.sub(r"[^\w.\-]", "_", filename, flags=re.UNICODE).strip("._") or "document.txt"
+            source_path = output_dir / safe_name
+            source_path.write_bytes(content)
         _write_json(output_dir / "config.json", config.model_dump())
         job = Job(job_id, filename, source_path, output_dir, config)
-        job.note("文件已接收，等待处理。")
+        job.note("图谱任务已创建，等待处理。" if config.mode == "generate" else "文件已接收，等待处理。")
         with self.lock:
             self.jobs[job_id] = job
         if start:
-            self.executor.submit(self.run, job, api_key)
+            self.executor.submit(self.run, job, api_key, neo4j_password)
         return job
 
     def get(self, job_id: str) -> Job:
@@ -206,21 +233,25 @@ class JobManager:
         config_path = output_dir / "config.json"
         if not config_path.is_file():
             return None
-        source = next((path for path in output_dir.iterdir()
-                       if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS), None)
-        if source is None:
-            return None
         try:
             config = RunConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+            source = next((path for path in output_dir.iterdir()
+                           if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS), None)
+            if source is None and config.mode != "generate":
+                return None
             state_path = output_dir / "job_state.json"
             state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
             qa_path = output_dir / "qa.json"
             items = json.loads(qa_path.read_text(encoding="utf-8")) if qa_path.exists() else []
-            job = Job(job_id, state.get("filename", source.name), source, output_dir, config)
+            job = Job(job_id, state.get("filename", source.name if source else "已有图谱"),
+                      source, output_dir, config)
+            job.graph_id = state.get("graph_id")
             job.items = items
             job.created_at = state.get("created_at", job.created_at)
             job.logs = state.get("logs", [])[-500:]
-            completed = all((output_dir / f"sft_{fmt}.json").exists() for fmt in FORMATS)
+            completed = state.get("status") == "completed" and (
+                (output_dir / "graph.json").exists() if config.mode == "build" else
+                all((output_dir / f"sft_{fmt}.json").exists() for fmt in FORMATS))
             job.status = "completed" if completed else "failed"
             job.stage = "completed" if completed else "failed"
             job.progress = 100 if completed else state.get("progress", 0)
@@ -248,61 +279,101 @@ class JobManager:
         return CheckedModel(OpenAICompatibleModel(config.api_url, name, api_key,
                                                    enable_thinking=False), job)
 
-    def run(self, job: Job, api_key: str) -> None:
+    def _neo4j(self, config: RunConfig, password: str) -> Neo4jGraphStore:
+        return Neo4jGraphStore(config.neo4j_uri, config.neo4j_user,
+                               password or os.getenv("MILKG_NEO4J_PASSWORD", ""),
+                               config.neo4j_database)
+
+    def run(self, job: Job, api_key: str, neo4j_password: str = "") -> None:
         config = job.config
+        store = None
         try:
             with job.lock:
                 job.status = "running"
-            job.note("读取文档并进行分块。", stage="reading", progress=2, current=0, total=0)
-            chunks = load_chunks([job.source_path], config.max_chars, config.overlap)
-            if not chunks:
-                raise ValueError("文档没有可提取的文本")
-            _write_json(job.output_dir / "chunks.json", [chunk.__dict__ for chunk in chunks])
-            job.note(f"完成分块，共 {len(chunks)} 个片段。", stage="extracting", progress=8,
-                     current=0, total=len(chunks))
-            extractor = self._model(config, config.extract_model, api_key, job)
-            extractions = []
-            for index, chunk in enumerate(chunks, 1):
-                job.note(f"片段 {index}/{len(chunks)}：正在抽取实体。", stage="extracting")
-                result = extract_chunk(chunk, extractor, config.min_confidence,
-                                       config.extract_temperature,
-                                       on_phase=lambda message, i=index: job.note(
-                                           f"片段 {i}/{len(chunks)}：{message}。", stage="extracting"))
-                extractions.append(result)
-                _write_json(job.output_dir / "extractions.json", extractions)
-                percent = 8 + round(42 * index / len(chunks))
-                details = result.get("diagnostics", {})
-                job.note(f"片段 {index}/{len(chunks)}：{len(result['entities'])} 个实体，"
-                         f"{len(result['relations'])} 条关系（模型候选 "
-                         f"{details.get('relation_candidates', len(result['relations']))} 条）。",
-                         stage="extracting",
-                         progress=percent, current=index, total=len(chunks))
-                reasons = details.get("relation_rejections", {})
-                if reasons:
-                    summary = "、".join(
-                        f"{RELATION_REJECTION_LABELS.get(reason, reason)} {count} 条"
-                        for reason, count in reasons.items()
-                    )
-                    job.note(f"片段 {index}/{len(chunks)} 关系过滤：{summary}。",
-                             stage="extracting", level="warning")
-                if details.get("focused_pass_error"):
-                    job.note(f"片段 {index}/{len(chunks)} 的关系复查请求失败："
-                             f"{details['focused_pass_error']}；已保留首轮结果。",
-                             stage="extracting", level="warning")
-            kg = MilitaryGraph()
-            for extraction in extractions:
-                kg.add_extraction(extraction)
-            kg.save(job.output_dir / "graph_raw.json")
-            job.note(f"建图完成：{kg.graph.number_of_nodes()} 个节点，"
-                     f"{kg.graph.number_of_edges()} 条关系。", stage="graph", progress=55,
-                     current=0, total=0)
-            if config.materialize_specs:
-                added = materialize_specifications(kg, chunks)
-                job.note(f"补充 {added} 条有原文证据的技术规格关系。", stage="graph", progress=60)
-            kg.save(job.output_dir / "graph.json")
+            if config.storage == "neo4j":
+                store = self._neo4j(config, neo4j_password)
+            if config.mode == "generate":
+                kg = store.load_graph(config.graph_id)
+                job.graph_id = config.graph_id
+                kg.save(job.output_dir / "graph.json")
+                _write_json(job.output_dir / "graph_ref.json",
+                            {"storage": "neo4j", "graph_id": job.graph_id,
+                             "database": store.database})
+                job.note(f"已载入图谱 {config.graph_id}。", stage="graph", progress=60)
+            else:
+                job.note("读取文档并进行分块。", stage="reading", progress=2, current=0, total=0)
+                chunks = load_chunks([job.source_path], config.max_chars, config.overlap)
+                if not chunks:
+                    raise ValueError("文档没有可提取的文本")
+                _write_json(job.output_dir / "chunks.json", [chunk.__dict__ for chunk in chunks])
+                job.note(f"完成分块，共 {len(chunks)} 个片段。", stage="extracting", progress=8,
+                         current=0, total=len(chunks))
+                extractor = self._model(config, config.extract_model, api_key, job)
+                extractions = []
+                for index, chunk in enumerate(chunks, 1):
+                    job.note(f"片段 {index}/{len(chunks)}：正在抽取实体。", stage="extracting")
+                    result = extract_chunk(chunk, extractor, config.min_confidence,
+                                           config.extract_temperature,
+                                           on_phase=lambda message, i=index: job.note(
+                                               f"片段 {i}/{len(chunks)}：{message}。", stage="extracting"))
+                    extractions.append(result)
+                    _write_json(job.output_dir / "extractions.json", extractions)
+                    percent = 8 + round(42 * index / len(chunks))
+                    details = result.get("diagnostics", {})
+                    job.note(f"片段 {index}/{len(chunks)}：{len(result['entities'])} 个实体，"
+                             f"{len(result['relations'])} 条关系（模型候选 "
+                             f"{details.get('relation_candidates', len(result['relations']))} 条）。",
+                             stage="extracting", progress=percent,
+                             current=index, total=len(chunks))
+                    reasons = details.get("relation_rejections", {})
+                    if reasons:
+                        summary = "、".join(
+                            f"{RELATION_REJECTION_LABELS.get(reason, reason)} {count} 条"
+                            for reason, count in reasons.items()
+                        )
+                        job.note(f"片段 {index}/{len(chunks)} 关系过滤：{summary}。",
+                                 stage="extracting", level="warning")
+                    if details.get("focused_pass_error"):
+                        job.note(f"片段 {index}/{len(chunks)} 的关系复查请求失败："
+                                 f"{details['focused_pass_error']}；已保留首轮结果。",
+                                 stage="extracting", level="warning")
+                if store:
+                    if config.graph_action == "extend":
+                        job.graph_id = config.graph_id
+                        kg = store.load_graph(job.graph_id)
+                        previous = MilitaryGraph.from_dict(kg.to_dict())
+                    else:
+                        job.graph_id = store.create_graph(config.graph_name)
+                        kg, previous = MilitaryGraph(), None
+                else:
+                    kg, previous = MilitaryGraph(), None
+                for extraction in extractions:
+                    kg.add_extraction(extraction)
+                kg.save(job.output_dir / "graph_raw.json")
+                job.note(f"建图完成：{kg.graph.number_of_nodes()} 个节点，"
+                         f"{kg.graph.number_of_edges()} 条关系。", stage="graph", progress=55,
+                         current=0, total=0)
+                if config.materialize_specs:
+                    added = materialize_specifications(kg, chunks)
+                    job.note(f"补充 {added} 条有原文证据的技术规格关系。", stage="graph", progress=60)
+                if store:
+                    changes = store.save_graph(job.graph_id, kg, previous, document_rows(chunks))
+                    _write_json(job.output_dir / "graph_ref.json",
+                                {"storage": "neo4j", "graph_id": job.graph_id,
+                                 "database": store.database})
+                    job.note(f"Neo4j 图谱 {job.graph_id} 已保存：新增或更新 "
+                             f"{changes['changed_nodes']} 个节点、{changes['changed_edges']} 条关系。",
+                             stage="graph", progress=62)
+                kg.save(job.output_dir / "graph.json")
             with job.lock:
                 job.graph_nodes = kg.graph.number_of_nodes()
                 job.graph_edges = kg.graph.number_of_edges()
+            if config.mode == "build":
+                with job.lock:
+                    job.status = "completed"
+                job.note(f"构图完成：{job.graph_nodes} 个节点、{job.graph_edges} 条关系。",
+                         stage="completed", progress=100)
+                return
             subgraphs = traverse(kg, max_subgraphs=config.max_subgraphs)
             semantic_count = len(subgraphs)
             if config.include_atomic:
@@ -369,14 +440,36 @@ class JobManager:
                      stage="completed", progress=100, current=len(items), total=len(items))
         except Exception as exc:
             message = str(exc).replace(api_key, "[REDACTED]") if api_key else str(exc)
+            if neo4j_password:
+                message = message.replace(neo4j_password, "[REDACTED]")
             with job.lock:
                 job.status = "failed"
                 job.error = message[:1000]
             job.note(f"运行失败：{message[:500]}", level="error", stage="failed")
+        finally:
+            if store:
+                store.close()
 
 
 manager = JobManager()
 app = FastAPI(title="MilKG-QA Workbench", version="0.2.0")
+
+
+class GraphListRequest(BaseModel):
+    uri: str = "bolt://127.0.0.1:7687"
+    user: str = "neo4j"
+    password: str = ""
+    database: str = "neo4j"
+
+    @field_validator("uri")
+    @classmethod
+    def valid_uri(cls, value: str) -> str:
+        parsed = urlparse(value)
+        if parsed.scheme not in {"bolt", "bolt+s", "bolt+ssc", "neo4j", "neo4j+s", "neo4j+ssc"}:
+            raise ValueError("Neo4j 地址须使用 bolt:// 或 neo4j:// 协议")
+        if parsed.username or parsed.password:
+            raise ValueError("Neo4j 地址中不要包含登录凭据")
+        return value
 
 
 @app.get("/api/health")
@@ -385,12 +478,24 @@ def health() -> dict:
             "supported_extensions": sorted(SUPPORTED_EXTENSIONS)}
 
 
+@app.post("/api/graphs/list")
+def list_graphs(request: GraphListRequest) -> dict:
+    password = request.password or os.getenv("MILKG_NEO4J_PASSWORD", "")
+    try:
+        store = Neo4jGraphStore(request.uri, request.user, password, request.database)
+        try:
+            return {"graphs": store.list_graphs()}
+        finally:
+            store.close()
+    except Exception as exc:
+        message = str(exc).replace(password, "[REDACTED]") if password else str(exc)
+        raise HTTPException(status_code=400, detail=f"Neo4j 连接失败：{message[:300]}") from exc
+
+
 @app.post("/api/jobs", status_code=202)
-async def create_job(file: UploadFile = File(...), config: str = Form(...),
-                     api_key: str = Form(default="")) -> dict:
-    filename = file.filename or ""
-    if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="仅支持 TXT、MD、PDF、DOCX")
+async def create_job(file: UploadFile | None = File(None), config: str = Form(...),
+                     api_key: str = Form(default=""),
+                     neo4j_password: str = Form(default="")) -> dict:
     try:
         settings = RunConfig.model_validate_json(config)
     except Exception as exc:
@@ -398,12 +503,19 @@ async def create_job(file: UploadFile = File(...), config: str = Form(...),
     secret = api_key.strip() or os.getenv("ALIYUN_API_KEY", "").strip()
     if not secret:
         raise HTTPException(status_code=400, detail="请填写 API Key，或配置 ALIYUN_API_KEY")
-    content = await file.read(MAX_UPLOAD_BYTES + 1)
-    if not content:
-        raise HTTPException(status_code=400, detail="上传文件为空")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="文件不能超过 20 MB")
-    job = manager.create(filename, content, settings, secret)
+    if settings.mode == "generate":
+        filename, content = f"Neo4j 图谱 {settings.graph_id}", None
+    else:
+        filename = file.filename if file else ""
+        if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="仅支持 TXT、MD、PDF、DOCX")
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        if not content:
+            raise HTTPException(status_code=400, detail="上传文件为空")
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="文件不能超过 20 MB")
+    job = manager.create(filename, content, settings, secret,
+                         neo4j_password=neo4j_password)
     return {"id": job.id, "status": job.status}
 
 
@@ -432,6 +544,8 @@ def download(job_id: str, format: str = "alpaca") -> FileResponse:
     with job.lock:
         if job.status != "completed":
             raise HTTPException(status_code=409, detail="任务尚未完成")
+        if job.config.mode == "build":
+            raise HTTPException(status_code=409, detail="当前任务只构建图谱，没有 SFT 数据集")
     path = job.output_dir / f"sft_{format}.json"
     return FileResponse(path, media_type="application/json",
                         filename=f"milkg_{job.id[:8]}_{format}.json")

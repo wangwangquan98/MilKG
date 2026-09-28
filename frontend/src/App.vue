@@ -10,8 +10,13 @@ const typeNames = {
   single_choice: '单选', multiple_choice: '多选', cot: '推理',
   true_false: '判断', fill_blank: '填空',
 }
-const stageMilestones = ['读取文档', '知识抽取', '图谱构建', '问答生成', '数据导出']
+const stageMilestones = computed(() => (job.value?.mode || config.mode) === 'generate'
+  ? ['载入图谱', '遍历图谱', '问答生成', '数据导出']
+  : (job.value?.mode || config.mode) === 'build' ? ['读取文档', '知识抽取', '图谱构建']
+    : ['读取文档', '知识抽取', '图谱构建', '问答生成', '数据导出'])
 const config = reactive({
+  mode: 'run', storage: 'json', graph_action: 'new', graph_id: null, graph_name: 'MilKG',
+  neo4j_uri: 'bolt://127.0.0.1:7687', neo4j_user: 'neo4j', neo4j_database: 'neo4j',
   api_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   extract_model: 'qwen3.5-flash', generate_model: 'qwen3.5-plus',
   extract_temperature: 0.1, generate_temperature: 0.7,
@@ -21,6 +26,10 @@ const config = reactive({
   question_types: Object.keys(typeNames), output_format: 'alpaca', seed: 42,
 })
 const apiKey = ref('')
+const neo4jPassword = ref('')
+const graphList = ref([])
+const graphListLoading = ref(false)
+const graphListError = ref('')
 const showKey = ref(false)
 const file = ref(null)
 const fileInput = ref(null)
@@ -41,10 +50,19 @@ const logPanel = ref(null)
 let timer = null
 
 const isBusy = computed(() => submitting.value || ['queued', 'running'].includes(job.value?.status))
-const canStart = computed(() => !!file.value && !!health.value?.ok && !isBusy.value && config.question_types.length > 0)
+const canStart = computed(() => (config.mode === 'generate' || !!file.value) && !!health.value?.ok &&
+  !isBusy.value && (config.mode === 'build' || config.question_types.length > 0) &&
+  (config.storage !== 'neo4j' || (config.graph_action === 'new' && config.mode !== 'generate') || !!config.graph_id))
 const currentStageIndex = computed(() => {
   if (!job.value) return -1
-  if (job.value.status === 'completed') return stageMilestones.length
+  if (job.value.status === 'completed') return stageMilestones.value.length
+  if (job.value.mode === 'generate') {
+    if (job.value.stage === 'graph') return 0
+    if (job.value.stage === 'traversing') return 1
+    if (job.value.stage === 'generating') return 2
+    if (job.value.stage === 'exporting') return 3
+    return -1
+  }
   if (job.value.stage === 'reading') return 0
   if (job.value.stage === 'extracting') return 1
   if (job.value.stage === 'graph' || job.value.stage === 'traversing') return 2
@@ -53,6 +71,22 @@ const currentStageIndex = computed(() => {
   return -1
 })
 const progressLabel = computed(() => job.value?.total ? `${job.value.current} / ${job.value.total}` : '— / —')
+
+async function loadGraphs() {
+  graphListLoading.value = true
+  graphListError.value = ''
+  try {
+    const result = await api('/api/graphs/list', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uri: config.neo4j_uri, user: config.neo4j_user,
+        password: neo4jPassword.value, database: config.neo4j_database }) })
+    graphList.value = result.graphs
+    if (!graphList.value.some(graph => graph.id === config.graph_id)) config.graph_id = null
+  } catch (error) {
+    graphListError.value = error.message
+  } finally {
+    graphListLoading.value = false
+  }
+}
 
 function chooseFile(candidate) {
   if (!candidate) return
@@ -134,16 +168,17 @@ function startPolling() {
 async function startJob() {
   if (!canStart.value) return
   requestError.value = ''
-  if (Number(config.overlap) >= Number(config.max_chars)) {
+  if (config.mode !== 'generate' && Number(config.overlap) >= Number(config.max_chars)) {
     requestError.value = '分块重叠量必须小于块长。'
     return
   }
   submitting.value = true
   try {
     const data = new FormData()
-    data.append('file', file.value)
+    if (config.mode !== 'generate') data.append('file', file.value)
     data.append('config', JSON.stringify(config))
     data.append('api_key', apiKey.value.trim())
+    data.append('neo4j_password', neo4jPassword.value)
     const created = await api('/api/jobs', { method: 'POST', body: data })
     apiKey.value = ''
     page.value = 0
@@ -170,6 +205,8 @@ function timeOnly(value) {
   return value ? new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) : ''
 }
 watch(page, loadItems)
+watch(() => config.mode, mode => { if (mode === 'generate') { config.storage = 'neo4j'; config.graph_action = 'extend' } })
+watch(() => config.storage, storage => { if (storage === 'json') { config.graph_action = 'new'; config.graph_id = null } })
 watch(selectedType, () => { if (page.value) page.value = 0; else loadItems(); expanded.value = -1 })
 watch(() => job.value?.logs?.length, async () => {
   await nextTick()
@@ -196,9 +233,9 @@ onUnmounted(stopPolling)
 
     <main>
       <section class="intro">
-        <div class="eyebrow"><span class="eyebrow-line"></span> DOCUMENT TO DATASET <span class="version">/ 01</span></div>
-        <h1>让文档中的知识，<br /><em>成为可溯源的训练数据。</em></h1>
-        <p>上传原始资料，构建知识图谱，再生成有事实依据的 SFT 问答。每一步都清晰可见。</p>
+        <div class="eyebrow"><span class="eyebrow-line"></span> DOCUMENT · GRAPH · DATASET <span class="version">/ 01</span></div>
+        <h1>让多份文档的知识，<br /><em>汇入同一张图谱。</em></h1>
+        <p>按需构图、扩展已有图谱，或从图谱独立生成 SFT 问答。每一步都清晰可见。</p>
       </section>
 
       <div v-if="healthError" class="service-alert"><span>!</span>{{ healthError }}<button @click="checkHealth">重新连接 ↗</button></div>
@@ -207,13 +244,34 @@ onUnmounted(stopPolling)
         <div class="panel config-panel">
           <div class="panel-heading"><div><span class="section-no">01 / INPUT</span><h2>数据与参数</h2></div><span class="heading-icon">↗</span></div>
 
-          <div class="field-block">
+          <div class="field-block"><div class="field-head"><label>运行方式</label><span>选择本次任务</span></div>
+            <div class="mode-selector">
+              <label :class="{ selected: config.mode === 'run' }"><input v-model="config.mode" type="radio" value="run" /><strong>构图并生成</strong><small>上传文档，完成全流程</small></label>
+              <label :class="{ selected: config.mode === 'build' }"><input v-model="config.mode" type="radio" value="build" /><strong>只构建图谱</strong><small>抽取实体关系并保存</small></label>
+              <label :class="{ selected: config.mode === 'generate' }"><input v-model="config.mode" type="radio" value="generate" /><strong>只生成 SFT</strong><small>读取已有 Neo4j 图谱</small></label>
+            </div>
+          </div>
+
+          <div v-if="config.mode !== 'generate'" class="field-block">
             <div class="field-head"><label>原始文档</label><span>≤ 20 MB</span></div>
             <div class="upload-zone" :class="{ dragging, filled: file }" tabindex="0" role="button" aria-label="上传文档" @click="fileInput?.click()" @keydown.enter="fileInput?.click()" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
               <input ref="fileInput" type="file" accept=".txt,.md,.pdf,.docx" hidden @change="chooseFile($event.target.files?.[0])" />
               <template v-if="file"><span class="file-icon">TXT</span><span class="file-detail"><strong>{{ file.name }}</strong><small>{{ formatSize(file.size) }} · 点击更换文件</small></span><span class="upload-arrow">↗</span></template>
               <template v-else><span class="upload-symbol">↥</span><strong>点击选择或拖入文档</strong><small>支持 TXT / MD / PDF / DOCX</small></template>
             </div>
+          </div>
+
+          <div class="divider"></div>
+          <div class="field-block"><div class="field-head"><label>图谱存储</label><span>{{ config.storage === 'neo4j' ? '跨任务共享' : '任务本地文件' }}</span></div>
+            <div class="storage-selector"><label v-if="config.mode !== 'generate'"><input v-model="config.storage" type="radio" value="json" />本地 JSON</label><label><input v-model="config.storage" type="radio" value="neo4j" />Neo4j</label></div>
+            <template v-if="config.storage === 'neo4j'">
+              <div class="neo4j-grid"><div><label class="sub-label" for="neo4j-uri">连接地址</label><input id="neo4j-uri" v-model.trim="config.neo4j_uri" placeholder="bolt://127.0.0.1:7687" /></div><div><label class="sub-label" for="neo4j-database">数据库</label><input id="neo4j-database" v-model.trim="config.neo4j_database" placeholder="neo4j" /></div></div>
+              <div class="neo4j-grid"><div><label class="sub-label" for="neo4j-user">用户名</label><input id="neo4j-user" v-model.trim="config.neo4j_user" placeholder="neo4j" /></div><div><label class="sub-label" for="neo4j-password">密码 <span class="optional">留空读取 MILKG_NEO4J_PASSWORD</span></label><input id="neo4j-password" v-model="neo4jPassword" type="password" autocomplete="off" /></div></div>
+              <div v-if="config.mode !== 'generate'" class="storage-selector graph-action"><label><input v-model="config.graph_action" type="radio" value="new" />新建逻辑图谱</label><label><input v-model="config.graph_action" type="radio" value="extend" />扩展已有图谱</label></div>
+              <div v-if="config.graph_action === 'new' && config.mode !== 'generate'"><label class="sub-label" for="graph-name">新图谱名称</label><input id="graph-name" v-model.trim="config.graph_name" placeholder="例如：轻武器资料库" /></div>
+              <div v-else><div class="graph-list-head"><label class="sub-label" for="graph-id">已有图谱</label><button type="button" :disabled="graphListLoading" @click="loadGraphs">{{ graphListLoading ? '读取中…' : '读取图谱列表 ↗' }}</button></div><select id="graph-id" v-model="config.graph_id" class="graph-select"><option :value="null">请选择图谱</option><option v-for="graph in graphList" :key="graph.id" :value="graph.id">{{ graph.name }} · {{ graph.node_count }} 节点 / {{ graph.edge_count }} 关系</option></select><p v-if="graphListError" class="form-error">{{ graphListError }}</p></div>
+              <span class="field-hint">密码仅用于本次连接。新建图谱不会清空已有数据；扩展会合并实体及来源。</span>
+            </template>
           </div>
 
           <div class="divider"></div>
@@ -225,20 +283,20 @@ onUnmounted(stopPolling)
           </div>
 
           <div class="divider"></div>
-          <div class="field-block"><div class="field-head"><label>模型配置</label><span>提取 → 合成</span></div>
-            <div class="model-grid"><div><label class="sub-label" for="extract-model">实体关系提取</label><input id="extract-model" v-model.trim="config.extract_model" list="extract-models" placeholder="qwen3.5-flash" /><datalist id="extract-models"><option value="qwen3.5-flash" /><option value="qwen-plus" /><option value="qwen-turbo" /></datalist></div><div><label class="sub-label" for="generate-model">问答合成</label><input id="generate-model" v-model.trim="config.generate_model" list="generate-models" placeholder="qwen3.5-plus" /><datalist id="generate-models"><option value="qwen3.5-plus" /><option value="qwen-max" /><option value="qwen-plus" /></datalist></div></div>
-            <div class="temp-row"><label for="extract-temp">提取温度 <b>{{ Number(config.extract_temperature).toFixed(1) }}</b></label><input id="extract-temp" v-model.number="config.extract_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
-            <div class="temp-row"><label for="generate-temp">合成温度 <b>{{ Number(config.generate_temperature).toFixed(1) }}</b></label><input id="generate-temp" v-model.number="config.generate_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
+          <div class="field-block"><div class="field-head"><label>模型配置</label><span>按任务启用</span></div>
+            <div class="model-grid" :class="{ single: config.mode !== 'run' }"><div v-if="config.mode !== 'generate'"><label class="sub-label" for="extract-model">实体关系提取</label><input id="extract-model" v-model.trim="config.extract_model" list="extract-models" placeholder="qwen3.5-flash" /><datalist id="extract-models"><option value="qwen3.5-flash" /><option value="qwen-plus" /><option value="qwen-turbo" /></datalist></div><div v-if="config.mode !== 'build'"><label class="sub-label" for="generate-model">问答合成</label><input id="generate-model" v-model.trim="config.generate_model" list="generate-models" placeholder="qwen3.5-plus" /><datalist id="generate-models"><option value="qwen3.5-plus" /><option value="qwen-max" /><option value="qwen-plus" /></datalist></div></div>
+            <div v-if="config.mode !== 'generate'" class="temp-row"><label for="extract-temp">提取温度 <b>{{ Number(config.extract_temperature).toFixed(1) }}</b></label><input id="extract-temp" v-model.number="config.extract_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
+            <div v-if="config.mode !== 'build'" class="temp-row"><label for="generate-temp">合成温度 <b>{{ Number(config.generate_temperature).toFixed(1) }}</b></label><input id="generate-temp" v-model.number="config.generate_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
           </div>
 
           <button class="advanced-toggle" type="button" :aria-expanded="advanced" @click="advanced = !advanced"><span>高级参数</span><span>{{ advanced ? '−' : '+' }}</span></button>
           <div v-if="advanced" class="advanced-content">
-            <div class="number-grid"><label>分块字符数<input v-model.number="config.max_chars" type="number" min="400" max="8000" /></label><label>重叠字符数<input v-model.number="config.overlap" type="number" min="0" max="1000" /></label><label>最多语义子图<input v-model.number="config.max_subgraphs" type="number" min="1" max="200" /></label><label>最多单跳事实<input v-model.number="config.max_atomic" type="number" min="0" max="100" /></label><label>每图生成次数<input v-model.number="config.per_subgraph" type="number" min="1" max="5" /></label><label>最低置信度<input v-model.number="config.min_confidence" type="number" min="0" max="1" step="0.05" /></label></div>
-            <p class="advanced-hint">语义子图上限只限制多关系出题素材的数量；实际数量取决于图谱中的关系。单跳事实和技术规格需要在下方分别开启。</p>
-            <div class="advanced-line"><span>问答题型</span><div class="check-grid"><label v-for="(name, type) in typeNames" :key="type" class="check-option"><input v-model="config.question_types" type="checkbox" :value="type" />{{ name }}</label></div></div>
-            <div class="switch-line"><label><input v-model="config.include_atomic" type="checkbox" />加入单跳事实</label><label><input v-model="config.materialize_specs" type="checkbox" />补充技术规格关系</label></div>
+            <div class="number-grid"><label v-if="config.mode !== 'generate'">分块字符数<input v-model.number="config.max_chars" type="number" min="400" max="8000" /></label><label v-if="config.mode !== 'generate'">重叠字符数<input v-model.number="config.overlap" type="number" min="0" max="1000" /></label><label v-if="config.mode !== 'build'">最多语义子图<input v-model.number="config.max_subgraphs" type="number" min="1" max="200" /></label><label v-if="config.mode !== 'build'">最多单跳事实<input v-model.number="config.max_atomic" type="number" min="0" max="100" /></label><label v-if="config.mode !== 'build'">每图生成次数<input v-model.number="config.per_subgraph" type="number" min="1" max="5" /></label><label v-if="config.mode !== 'generate'">最低置信度<input v-model.number="config.min_confidence" type="number" min="0" max="1" step="0.05" /></label></div>
+            <p v-if="config.mode !== 'build'" class="advanced-hint">语义子图上限只限制多关系出题素材的数量；实际数量取决于图谱中的关系。单跳事实和技术规格需要在下方分别开启。</p>
+            <div v-if="config.mode !== 'build'" class="advanced-line"><span>问答题型</span><div class="check-grid"><label v-for="(name, type) in typeNames" :key="type" class="check-option"><input v-model="config.question_types" type="checkbox" :value="type" />{{ name }}</label></div></div>
+            <div class="switch-line"><label v-if="config.mode !== 'build'"><input v-model="config.include_atomic" type="checkbox" />加入单跳事实</label><label v-if="config.mode !== 'generate'"><input v-model="config.materialize_specs" type="checkbox" />补充技术规格关系</label></div>
           </div>
-          <div class="start-area"><button class="primary-button" :disabled="!canStart" @click="startJob"><span>{{ isBusy ? '正在处理文档' : '开始生成数据集' }}</span><span>{{ isBusy ? '···' : '→' }}</span></button><p v-if="requestError" class="form-error">{{ requestError }}</p><p v-else>生成期间可以实时查看进度与结果。</p></div>
+          <div class="start-area"><button class="primary-button" :disabled="!canStart" @click="startJob"><span>{{ isBusy ? '任务运行中' : config.mode === 'build' ? '开始构建图谱' : config.mode === 'generate' ? '从图谱生成 SFT' : '开始生成数据集' }}</span><span>{{ isBusy ? '···' : '→' }}</span></button><p v-if="requestError" class="form-error">{{ requestError }}</p><p v-else>任务进度和结果会在右侧实时更新。</p></div>
         </div>
 
         <div class="right-column">
@@ -246,7 +304,7 @@ onUnmounted(stopPolling)
             <div class="progress-display"><div><span class="progress-caption">CURRENT STAGE</span><h3>{{ job ? stageNames[job.stage] || '处理中' : '准备就绪' }}</h3><p>{{ job?.status === 'failed' ? job.error : job ? `${job.filename || '文档'} · ${progressLabel}` : '上传文档并设置参数，开始构建数据集。' }}</p></div><div class="progress-number">{{ job?.progress ?? 0 }}<small>%</small></div></div>
             <div class="progress-track"><div :style="{ width: `${job?.progress ?? 0}%` }"></div></div>
             <div class="milestones"><div v-for="(name, index) in stageMilestones" :key="name" :class="{ reached: currentStageIndex >= index, active: currentStageIndex === index }"><i></i><span>{{ name }}</span></div></div>
-            <div v-if="job?.graph_nodes" class="graph-metrics"><span><b>{{ job.graph_nodes }}</b> 节点</span><span><b>{{ job.graph_edges }}</b> 关系边</span><span><b>{{ job.semantic_subgraphs }}</b> 语义子图</span><span><b>{{ job.atomic_subgraphs }}</b> 单跳事实</span></div>
+            <div v-if="job?.graph_nodes" class="graph-metrics"><span><b>{{ job.graph_nodes }}</b> 节点</span><span><b>{{ job.graph_edges }}</b> 关系边</span><span><b>{{ job.semantic_subgraphs }}</b> 语义子图</span><span><b>{{ job.atomic_subgraphs }}</b> 单跳事实</span></div><p v-if="job?.graph_id" class="graph-id">Neo4j 图谱 ID：{{ job.graph_id }}</p>
           </div>
 
           <div class="panel log-panel"><div class="panel-heading"><div><span class="section-no">03 / ACTIVITY</span><h2>运行日志</h2></div><span class="log-count">{{ job?.logs?.length || 0 }} EVENTS</span></div>
@@ -255,7 +313,8 @@ onUnmounted(stopPolling)
         </div>
       </section>
 
-      <section class="preview-section"><div class="preview-title"><div><span class="section-no">04 / OUTPUT</span><h2>数据集预览 <span>{{ itemTotal ? String(itemTotal).padStart(2, '0') : '—' }}</span></h2><p>逐条查看问答内容、证据编号与生成策略。</p></div><div class="export-controls"><select v-model="config.output_format" aria-label="导出格式"><option value="alpaca">Alpaca JSON</option><option value="sharegpt">ShareGPT JSON</option><option value="chatml">ChatML JSON</option></select><button :disabled="job?.status !== 'completed'" @click="download()">下载数据集 <span>↗</span></button></div></div>
+      <section v-if="job?.mode === 'build' || (!job && config.mode === 'build')" class="preview-section"><div class="preview-title"><div><span class="section-no">04 / OUTPUT</span><h2>知识图谱</h2><p>构图任务完成后，可切换到“只生成 SFT”读取图谱。</p></div></div><div class="empty-preview"><div class="empty-graphic"><span>DOC</span><span>→</span><span>KG</span></div><h3>{{ job?.status === 'completed' ? '图谱已保存' : '等待构图' }}</h3><p v-if="job?.graph_id">图谱 ID：{{ job.graph_id }}</p><p v-else>Neo4j 模式可在下一次任务中继续扩展图谱。</p></div></section>
+      <section v-else class="preview-section"><div class="preview-title"><div><span class="section-no">04 / OUTPUT</span><h2>数据集预览 <span>{{ itemTotal ? String(itemTotal).padStart(2, '0') : '—' }}</span></h2><p>逐条查看问答内容、内部证据编号与生成策略。</p></div><div class="export-controls"><select v-model="config.output_format" aria-label="导出格式"><option value="alpaca">Alpaca JSON</option><option value="sharegpt">ShareGPT JSON</option><option value="chatml">ChatML JSON</option></select><button :disabled="job?.status !== 'completed'" @click="download()">下载数据集 <span>↗</span></button></div></div>
         <div v-if="job?.item_count" class="preview-card"><div class="preview-toolbar"><div class="filter-tabs"><button v-for="(name, type) in { all: '全部', ...typeNames }" :key="type" :class="{ selected: selectedType === type }" @click="selectedType = type">{{ name }}</button></div><span>{{ itemTotal ? `第 ${page * pageSize + 1}–${Math.min(itemTotal, (page + 1) * pageSize)} 条` : '无结果' }} / 共 {{ itemTotal }} 条</span></div>
           <div v-if="!items.length" class="filter-empty">没有该题型的问答。请选择其他题型。</div>
           <article v-for="(item, index) in items" :key="`${page}-${index}`" class="qa-item"><button class="qa-summary" @click="expanded = expanded === index ? -1 : index"><span class="qa-index">{{ String(page * pageSize + index + 1).padStart(2, '0') }}</span><span class="qa-main"><span class="qa-tags"><span>{{ typeNames[item.type] || item.type }}</span><span>{{ item.difficulty === 'easy' ? '基础' : item.difficulty === 'hard' ? '进阶' : '中等' }}</span></span><strong>{{ item.question }}</strong><small>答案：{{ displayAnswer(item.answer) }}</small></span><span class="expand-mark">{{ expanded === index ? '−' : '+' }}</span></button><div v-if="expanded === index" class="qa-detail"><div v-if="item.options?.length" class="option-grid"><div v-for="option in item.options" :key="option.label" :class="{ correct: item.answer?.includes(option.label) }"><b>{{ option.label }}</b>{{ option.text }}</div></div><div class="detail-row"><span>解释</span><p>{{ item.explanation || '—' }}</p></div><div class="detail-row"><span>支持事实</span><p>{{ item.supporting_facts?.join(' · ') || '—' }}</p></div><div class="detail-row"><span>生成策略</span><p>{{ item.strategy || '—' }}</p></div></div></article>

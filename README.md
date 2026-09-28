@@ -9,12 +9,14 @@
 | Python 后端与命令行 | Python 3.10 或更高版本 |
 | WebUI 构建 | Node.js 22.18 或更高版本、npm |
 | 在线生成 | 可调用的 OpenAI 兼容聊天模型 API 与 API Key；默认配置使用阿里云百炼 Qwen |
+| 跨文档图谱 | Neo4j 服务及其 Bolt 地址、用户名和密码；本地 JSON 模式无需 Neo4j |
 
 Python 依赖由 `pyproject.toml` 管理：
 
 - 核心：`networkx`。
 - 读取 PDF / DOCX：`pypdf`、`python-docx`，对应 `documents` 可选依赖。
 - Web 服务：`fastapi`、`uvicorn`、`python-multipart`，对应 `web` 可选依赖。
+- Neo4j 存储：官方 `neo4j` Python 驱动，对应 `neo4j` 可选依赖。
 - 测试：`pytest`，对应 `test` 可选依赖。
 
 前端依赖由 `frontend/package-lock.json` 锁定，主要是 Vue 3、Vite 和 Vue 的 Vite 插件。只使用命令行时无需安装 Node.js。
@@ -28,7 +30,7 @@ git clone https://github.com/wangwangquan98/MilKG.git
 cd MilKG
 python -m venv .venv
 ./.venv/Scripts/python -m pip install --upgrade pip
-./.venv/Scripts/python -m pip install -e ".[documents,web]"
+./.venv/Scripts/python -m pip install -e ".[documents,web,neo4j]"
 cd frontend
 npm ci
 npm run build
@@ -51,11 +53,13 @@ cd ..
 
 浏览器打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。服务默认只监听本机 `127.0.0.1`。
 
-1. 上传 TXT、MD、PDF 或 DOCX 文件，单文件上限为 20 MB。
+1. 选择“构图并生成”“只构建图谱”或“只生成 SFT”。构图任务上传 TXT、MD、PDF 或 DOCX 文件，单文件上限为 20 MB；独立生成任务无需上传文件。
 2. 填写 API Key，或在启动服务前设置环境变量 `ALIYUN_API_KEY`。页面填写的 Key 只用于当前任务，不写入任务配置或数据集。
-3. 选择实体关系提取模型、问答生成模型、API 端点和温度；需要时展开“高级参数”设置分块、题型与生成数量。
-4. 点击“开始生成数据集”，查看当前阶段、进度、日志和已通过校验的问答。
-5. 完成后选择 Alpaca、ShareGPT 或 ChatML 格式下载 JSON。
+3. 选择本地 JSON 或 Neo4j 存储。使用 Neo4j 时填写 Bolt 地址、数据库、用户名和密码；构图选择“新建逻辑图谱”或“扩展已有图谱”。扩展或独立生成时点击“读取图谱列表”并选择目标图谱。
+4. 设置当前阶段所需的模型、温度和高级参数，启动任务并查看日志。
+5. 生成任务完成后下载 Alpaca、ShareGPT 或 ChatML JSON。只构图任务不生成 SFT，页面会显示图谱 ID，可供下次扩展或独立生成。
+
+Neo4j 密码可留空读取后端环境变量 `MILKG_NEO4J_PASSWORD`；密码不会写入任务配置。新建逻辑图谱会分配新的图谱 ID，不会清空数据库。扩展图谱会将新文档实体与该图谱中已有实体对齐，并累计节点、关系及文档来源。每次任务仍保留一份 `graph.json` 快照供检查，Neo4j 是跨任务共享图谱的来源。
 
 下载的 SFT 记录只含训练所需的题目和自然语言答案，不包含图谱节点/边 ID 或内部溯源元数据。`qa.json` 保留事实 ID 供本地核验；模型解释若出现图谱引用会先尝试改写，仍不合格则不会进入数据集。
 
@@ -90,6 +94,37 @@ $env:MILKG_GENERATE_KEY = $env:ALIYUN_API_KEY
 ```
 
 `run` 接受一个或多个文档或目录。上例生成 `output/run/sft_alpaca.json`。如需其他格式，使用 `--format sharegpt` 或 `--format chatml`。命令行不会自动读取 `ALIYUN_API_KEY`；示例中明确将它赋给抽取和生成所需的两个变量。
+
+### Neo4j 跨文档图谱
+
+先准备 Neo4j 服务。已有服务时直接使用其 Bolt 地址；若使用 Docker，可参照 [Neo4j 官方 Docker 指南](https://neo4j.com/docs/operations-manual/current/docker/introduction/)创建持久化卷并启动容器：
+
+```powershell
+docker volume create milkg-neo4j-data
+docker run -d --name milkg-neo4j -p 7474:7474 -p 7687:7687 -e "NEO4J_AUTH=neo4j/YourStrongPassword" -v milkg-neo4j-data:/data neo4j:2026.09.0
+$env:MILKG_NEO4J_URI = "bolt://127.0.0.1:7687"
+$env:MILKG_NEO4J_USER = "neo4j"
+$env:MILKG_NEO4J_PASSWORD = "YourStrongPassword"
+```
+
+下面把两批文档写入同一个逻辑图谱，再单独从完整图谱生成数据集；抽取与生成模型的环境变量沿用上面的示例：
+
+```powershell
+./.venv/Scripts/python -m milkg.cli build ./docs/batch1 --store neo4j --graph-action new --graph-name "轻武器资料库" --output output/build1 --disable-thinking
+$graphId = (Get-Content output/build1/graph_ref.json -Raw | ConvertFrom-Json).graph_id
+./.venv/Scripts/python -m milkg.cli build ./docs/batch2 --store neo4j --graph-action extend --graph-id $graphId --output output/build2 --disable-thinking
+./.venv/Scripts/python -m milkg.cli generate --store neo4j --graph-id $graphId --output output/sft --disable-thinking --include-atomic --format alpaca
+```
+
+`graph_ref.json` 保存逻辑图谱 ID；`graph.json` 是当次快照。Neo4j 中的 `MilKGEntity` 节点通过 `MILKG_RELATION` 关系相连，关系类别保存在 `relation_type` 属性；`MilKGDocument` 和 `MENTIONED_IN` 保存文档来源。所有对象带 `graph_id`，可按图谱 ID 查询跨文档实体与关系。重复读取相同文档时，文档 ID 由内容哈希确定，来源不会重复累计。
+
+也可运行 `./.venv/Scripts/python -m milkg.cli graphs --store neo4j --output output/graphs` 列出已有图谱。以下 Cypher 可在 Neo4j Browser 中按图谱 ID 查询实体及其文档来源：
+
+```cypher
+MATCH (e:MilKGEntity {graph_id: $graph_id})-[:MENTIONED_IN]->(d:MilKGDocument)
+RETURN e.name AS entity, e.entity_type AS kind, collect(DISTINCT d.name) AS documents
+ORDER BY entity
+```
 
 常用参数：
 
