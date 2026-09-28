@@ -31,6 +31,17 @@ ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 FORMATS = {"alpaca", "sharegpt", "chatml"}
+RELATION_REJECTION_LABELS = {
+    "unknown_endpoint": "实体未通过校验",
+    "evidence_not_in_source": "证据不在原文",
+    "invalid_type_or_direction": "关系类型或方向不符",
+    "low_confidence": "置信度不足",
+    "no_development_statement": "缺少明确研发描述",
+    "generic_developer": "国别或朝代不是研发机构",
+    "no_counter_statement": "缺少明确克制或打击描述",
+    "endpoint_not_in_evidence": "单位或具体装备未出现在关系证据中",
+    "invalid_record": "记录格式错误",
+}
 
 
 def _now() -> str:
@@ -252,14 +263,32 @@ class JobManager:
             extractor = self._model(config, config.extract_model, api_key, job)
             extractions = []
             for index, chunk in enumerate(chunks, 1):
+                job.note(f"片段 {index}/{len(chunks)}：正在抽取实体。", stage="extracting")
                 result = extract_chunk(chunk, extractor, config.min_confidence,
-                                       config.extract_temperature)
+                                       config.extract_temperature,
+                                       on_phase=lambda message, i=index: job.note(
+                                           f"片段 {i}/{len(chunks)}：{message}。", stage="extracting"))
                 extractions.append(result)
                 _write_json(job.output_dir / "extractions.json", extractions)
                 percent = 8 + round(42 * index / len(chunks))
+                details = result.get("diagnostics", {})
                 job.note(f"片段 {index}/{len(chunks)}：{len(result['entities'])} 个实体，"
-                         f"{len(result['relations'])} 条关系。", stage="extracting",
+                         f"{len(result['relations'])} 条关系（模型候选 "
+                         f"{details.get('relation_candidates', len(result['relations']))} 条）。",
+                         stage="extracting",
                          progress=percent, current=index, total=len(chunks))
+                reasons = details.get("relation_rejections", {})
+                if reasons:
+                    summary = "、".join(
+                        f"{RELATION_REJECTION_LABELS.get(reason, reason)} {count} 条"
+                        for reason, count in reasons.items()
+                    )
+                    job.note(f"片段 {index}/{len(chunks)} 关系过滤：{summary}。",
+                             stage="extracting", level="warning")
+                if details.get("focused_pass_error"):
+                    job.note(f"片段 {index}/{len(chunks)} 的关系复查请求失败："
+                             f"{details['focused_pass_error']}；已保留首轮结果。",
+                             stage="extracting", level="warning")
             kg = MilitaryGraph()
             for extraction in extractions:
                 kg.add_extraction(extraction)

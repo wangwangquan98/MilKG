@@ -31,29 +31,65 @@ def read_document(path: Path) -> str:
     raise ValueError(f"Unsupported document: {path}")
 
 
+def preprocess_text(text: str) -> str:
+    """Join OCR-split Chinese words while retaining paragraph boundaries."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ").replace("\u3000", " ")
+    paragraphs = []
+    for part in re.split(r"\n[ \t]*\n+", text):
+        line = re.sub(r"\s+", " ", part).strip()
+        if not line:
+            continue
+        # OCR commonly inserts spaces inside Chinese words and at wrapped lines.
+        # Keep spaces between Latin words and keep paragraph breaks for chunking.
+        line = re.sub(r"(?<=[\u3400-\u9fff]) +(?=[\u3400-\u9fffA-Za-z0-9])", "", line)
+        line = re.sub(r"(?<=[A-Za-z0-9]) +(?=[\u3400-\u9fff])", "", line)
+        line = re.sub(r"(?<![A-Za-z])([A-Z]{1,4}) +(?=\d)", r"\1", line)
+        line = re.sub(r"(?<=[。！？]) +(?=[\u3400-\u9fff])", "", line)
+        paragraphs.append(line)
+    return "\n\n".join(paragraphs)
+
+
+def _split_long_paragraph(text: str, max_chars: int, overlap: int) -> list[str]:
+    """Prefer sentence ends without exceeding the requested chunk length."""
+    blocks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            endings = [match.end() for match in re.finditer(r"[。！？!?；;]", text[start:end])
+                       if match.end() >= int(max_chars * 0.65)]
+            if endings:
+                end = start + endings[-1]
+        blocks.append(text[start:end].strip())
+        if end == len(text):
+            break
+        start = max(start + 1, end - overlap)
+    return blocks
+
+
 def chunk_text(text: str, source: str, max_chars: int = 1800, overlap: int = 180) -> list[Chunk]:
     if max_chars < 100 or not 0 <= overlap < max_chars:
         raise ValueError("Require max_chars >= 100 and 0 <= overlap < max_chars")
-    # Keep section headings attached to their following paragraph; long blocks
-    # are split with overlap so cross-boundary relations remain visible.
+    text = preprocess_text(text)
+    # Keep short paragraphs together; split long OCR paragraphs near sentence
+    # endings with overlap so cross-boundary relations remain visible.
     paragraphs = [re.sub(r"\s+", " ", part).strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
-    blocks: list[str] = []
-    for para in paragraphs:
-        if len(para) <= max_chars:
-            blocks.append(para)
-        else:
-            step = max_chars - overlap
-            blocks.extend(para[i:i + max_chars] for i in range(0, len(para), step))
     chunks: list[str] = []
     current = ""
-    for block in blocks:
-        candidate = f"{current}\n\n{block}" if current else block
+    for para in paragraphs:
+        if len(para) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_split_long_paragraph(para, max_chars, overlap))
+            continue
+        candidate = f"{current}\n\n{para}" if current else para
         if current and len(candidate) > max_chars:
             chunks.append(current)
-            # A short context tail helps connect adjacent military sections.
-            current = f"{current[-overlap:]}\n\n{block}" if overlap else block
+            current = f"{current[-overlap:]}\n\n{para}" if overlap else para
             if len(current) > max_chars:
-                current = block
+                current = para
         else:
             current = candidate
     if current:

@@ -39,6 +39,7 @@ def test_web_job_processes_upload_and_exports(tmp_path):
     assert job.snapshot()["graph_nodes"] == 2
     assert job.snapshot()["graph_edges"] == 1
     assert job.snapshot()["atomic_subgraphs"] == 1
+    assert any("复查关系" in entry["message"] for entry in job.logs)
     assert job.items[0]["answer"] == "甲武器"
     assert "secret" not in (job.output_dir / "config.json").read_text(encoding="utf-8")
     assert (job.output_dir / "sft_alpaca.json").exists()

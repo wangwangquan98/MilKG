@@ -1,8 +1,9 @@
 import json
 
-from milkg.documents import Chunk, chunk_text
-from milkg.extraction import validate_extraction
+from milkg.documents import Chunk, chunk_text, preprocess_text
+from milkg.extraction import RELATION_GUIDANCE, extract_chunk, validate_extraction
 from milkg.graph import MilitaryGraph
+from milkg.ontology import ENTITY_TYPES, RELATIONS
 from milkg.qa import export_sft, generate_qa, rouge_l, validate_qa
 from milkg.training import evaluate_extractions, prepare_extractor_sft
 from milkg.evaluation import evaluate_qa, random_edge_baseline, traversal_metrics
@@ -42,6 +43,8 @@ def fixture_graph():
 
 
 def test_extraction_checks_evidence_and_direction():
+    assert len(ENTITY_TYPES) == 14 and len(RELATIONS) == 12
+    assert set(RELATION_GUIDANCE) == set(RELATIONS)
     chunk = Chunk("x:0", "x.txt", "甲平台搭载甲武器。甲单位操作甲平台。")
     raw = {"entities": [{"name": "甲平台", "type": "Platform/Carrier"},
                         {"name": "甲武器", "type": "Weapon System"},
@@ -53,6 +56,110 @@ def test_extraction_checks_evidence_and_direction():
     result = validate_extraction(raw, chunk)
     assert len(result["entities"]) == 2
     assert len(result["relations"]) == 1
+
+
+def test_ocr_preprocessing_before_chunking_preserves_paragraphs():
+    raw = "前苏 联研 制了MG 34式机枪。\n射 程为300 米。\n\n第二 段保留。"
+    cleaned = preprocess_text(raw)
+    assert cleaned == "前苏联研制了MG34式机枪。射程为300米。\n\n第二段保留。"
+    chunks = chunk_text(raw, "ocr.txt", 300, 20)
+    assert len(chunks) == 1
+    assert chunks[0].text == cleaned
+
+
+def test_long_ocr_paragraph_splits_at_sentence_boundaries():
+    text = "甲平台搭载甲武器。" * 60
+    chunks = chunk_text(text, "long.txt", 120, 20)
+    assert len(chunks) > 1
+    assert all(len(chunk.text) <= 120 and chunk.text.endswith("。") for chunk in chunks)
+
+
+def test_relation_review_recovers_ocr_spaced_evidence():
+    chunk = Chunk("x:1", "ocr.txt", "甲平台搭载甲 武器。")
+
+    class TwoPassModel:
+        calls = 0
+
+        def complete(self, system, user, temperature):
+            self.calls += 1
+            if self.calls == 1:
+                return {"entities": [{"name": "甲平台", "type": "Platform/Carrier"},
+                                     {"name": "甲武器", "type": "Weapon System"}],
+                        "relations": []}
+            assert "甲武器 (Weapon System)" in user
+            return {"relations": [{"source": "甲平台", "target": "甲武器",
+                                   "type": "Equip-Carry", "evidence": "甲平台搭载甲武器"}]}
+
+    model = TwoPassModel()
+    phases = []
+    result = extract_chunk(chunk, model, on_phase=phases.append)
+    assert model.calls == 2
+    assert "复查关系" in phases[0]
+    assert result["relations"][0]["evidence"] == "甲平台搭载甲 武器"
+    assert result["diagnostics"]["focused_relation_candidates"] == 1
+
+
+def test_country_of_origin_is_not_development_relation():
+    chunk = Chunk("x:2", "source.txt", "某兵工厂的甲武器很有名。")
+    raw = {"entities": [{"name": "某兵工厂", "type": "Military Facility"},
+                        {"name": "甲武器", "type": "Weapon System"}],
+           "relations": [{"source": "甲武器", "target": "某兵工厂",
+                          "type": "Equip-Develop", "evidence": "某兵工厂的甲武器"}]}
+    result = validate_extraction(raw, chunk)
+    assert result["relations"] == []
+    assert result["diagnostics"]["relation_rejections"]["no_development_statement"] == 1
+
+
+def test_generic_nationality_or_dynasty_cannot_be_developer():
+    for target in ("德国人", "元朝"):
+        text = f"{target}研制了甲武器。"
+        chunk = Chunk("x:3", "source.txt", text)
+        raw = {"entities": [{"name": target, "type": "Command Structure"},
+                            {"name": "甲武器", "type": "Weapon System"}],
+               "relations": [{"source": "甲武器", "target": target,
+                              "type": "Equip-Develop", "evidence": text}]}
+        result = validate_extraction(raw, chunk)
+        assert result["relations"] == []
+        assert result["diagnostics"]["relation_rejections"]["generic_developer"] == 1
+
+    valid_chunk = Chunk("x:4", "source.txt", "甲兵工厂设计了甲武器。")
+    valid_raw = {"entities": [{"name": "甲兵工厂", "type": "Military Facility"},
+                              {"name": "甲武器", "type": "Weapon System"}],
+                 "relations": [{"source": "甲武器", "target": "甲兵工厂",
+                                "type": "Equip-Develop", "evidence": valid_chunk.text}]}
+    assert len(validate_extraction(valid_raw, valid_chunk)["relations"]) == 1
+
+
+def test_superior_or_copied_equipment_is_not_a_counter_relation():
+    entities = [{"name": "甲武器", "type": "Weapon System"},
+                {"name": "乙武器", "type": "Weapon System"}]
+    for statement in ("甲武器性能优于乙武器。", "甲武器仿制了乙武器。"):
+        chunk = Chunk("x:5", "source.txt", statement)
+        raw = {"entities": entities,
+               "relations": [{"source": "甲武器", "target": "乙武器",
+                              "type": "Equip-Counter", "evidence": statement}]}
+        result = validate_extraction(raw, chunk)
+        assert result["relations"] == []
+        assert result["diagnostics"]["relation_rejections"]["no_counter_statement"] == 1
+
+    chunk = Chunk("x:6", "source.txt", "甲武器能够击毁乙武器。")
+    raw["relations"][0]["evidence"] = chunk.text
+    assert len(validate_extraction(raw, chunk)["relations"]) == 1
+
+
+def test_generic_equipment_statement_does_not_prove_specific_unit_equipment():
+    chunk = Chunk("x:7", "source.txt", "巴祖卡是火箭筒。火箭筒成为步兵班的骨干火力。")
+    raw = {"entities": [{"name": "步兵班", "type": "Combat Unit"},
+                        {"name": "巴祖卡", "type": "Weapon System"}],
+           "relations": [{"source": "步兵班", "target": "巴祖卡", "type": "Unit-Equip",
+                          "evidence": "火箭筒成为步兵班的骨干火力"}]}
+    result = validate_extraction(raw, chunk)
+    assert result["relations"] == []
+    assert result["diagnostics"]["relation_rejections"]["endpoint_not_in_evidence"] == 1
+
+    explicit = Chunk("x:8", "source.txt", "步兵班装备巴祖卡。")
+    raw["relations"][0]["evidence"] = explicit.text
+    assert len(validate_extraction(raw, explicit)["relations"]) == 1
 
 
 def test_alignment_dedup_and_round_trip(tmp_path):
