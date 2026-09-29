@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -44,6 +47,14 @@ RELATION_REJECTION_LABELS = {
     "endpoint_not_in_evidence": "单位或具体装备未出现在关系证据中",
     "invalid_record": "记录格式错误",
 }
+MODEL_HEARTBEAT_SECONDS = 30
+job_logger = logging.getLogger("milkg.web.jobs")
+if not job_logger.handlers:
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(logging.Formatter("%(message)s"))
+    job_logger.addHandler(stream)
+job_logger.setLevel(logging.INFO)
+job_logger.propagate = False
 
 
 def _now() -> str:
@@ -147,6 +158,8 @@ class Job:
     logs: list[dict] = field(default_factory=list)
     items: list[dict] = field(default_factory=list)
     created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+    log_count: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def note(self, message: str, level: str = "info", stage: str | None = None,
@@ -161,18 +174,27 @@ class Job:
                 self.current = current
             if total is not None:
                 self.total = total
-            self.logs.append({"time": _now(), "level": level,
-                              "stage": self.stage, "message": message})
+            entry = {"time": _now(), "level": level,
+                     "stage": self.stage, "message": message}
+            self.updated_at = entry["time"]
+            self.logs.append(entry)
+            self.log_count += 1
             self.logs = self.logs[-500:]
+            line = _log_line(self.id, entry)
+            with (self.output_dir / "process.log").open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
             _write_json(self.output_dir / "job_state.json", self.snapshot())
+            job_logger.log(logging.ERROR if level == "error" else
+                           logging.WARNING if level == "warning" else logging.INFO, line)
 
     def snapshot(self) -> dict:
         with self.lock:
             return {"id": self.id, "filename": self.filename, "status": self.status,
                     "stage": self.stage, "progress": self.progress,
                     "current": self.current, "total": self.total,
-                    "created_at": self.created_at, "error": self.error,
-                    "logs": list(self.logs), "item_count": len(self.items),
+                    "created_at": self.created_at, "updated_at": self.updated_at,
+                    "error": self.error, "logs": list(self.logs),
+                    "log_count": self.log_count, "item_count": len(self.items),
                     "graph_nodes": self.graph_nodes, "graph_edges": self.graph_edges,
                     "graph_id": self.graph_id or self.config.graph_id,
                     "mode": self.config.mode, "storage": self.config.storage,
@@ -187,7 +209,27 @@ class CheckedModel:
         self.job = job
 
     def complete(self, system: str, user: str, temperature: float) -> dict:
-        return self.client.complete(system, user, temperature)
+        done = threading.Event()
+        started = time.monotonic()
+
+        def heartbeat() -> None:
+            while not done.wait(MODEL_HEARTBEAT_SECONDS):
+                elapsed = int(time.monotonic() - started)
+                self.job.note(f"模型请求仍在进行，已等待 {elapsed} 秒。")
+
+        watcher = threading.Thread(target=heartbeat, name=f"milkg-heartbeat-{self.job.id[:8]}",
+                                   daemon=True)
+        watcher.start()
+        try:
+            return self.client.complete(system, user, temperature)
+        finally:
+            done.set()
+            watcher.join()
+
+
+def _log_line(job_id: str, entry: dict) -> str:
+    return (f"{entry['time']} [{entry['level'].upper()}] "
+            f"[{job_id[:8]}] [{entry['stage']}] {entry['message']}")
 
 
 class JobManager:
@@ -225,8 +267,32 @@ class JobManager:
                 if job is not None:
                     self.jobs[job_id] = job
         if job is None:
-            raise HTTPException(status_code=404, detail="任务不存在或服务已重启")
+            raise HTTPException(status_code=404, detail="任务不存在")
         return job
+
+    def list_jobs(self, limit: int = 30) -> list[dict]:
+        with self.lock:
+            active = dict(self.jobs)
+        summaries = []
+        for output_dir in self.output_root.iterdir():
+            if not output_dir.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", output_dir.name):
+                continue
+            job = active.get(output_dir.name)
+            if job is not None:
+                state = job.snapshot()
+            else:
+                state_path = output_dir / "job_state.json"
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if state.get("status") in {"queued", "running"}:
+                    state["status"] = "failed"
+                    state["stage"] = "failed"
+            summaries.append({key: state.get(key) for key in
+                              ("id", "filename", "status", "stage", "progress", "created_at", "updated_at")})
+        summaries.sort(key=lambda row: row.get("updated_at") or row.get("created_at") or "", reverse=True)
+        return summaries[:limit]
 
     def _restore(self, job_id: str) -> Job | None:
         output_dir = self.output_root / job_id
@@ -248,7 +314,13 @@ class JobManager:
             job.graph_id = state.get("graph_id")
             job.items = items
             job.created_at = state.get("created_at", job.created_at)
+            job.updated_at = state.get("updated_at", job.created_at)
             job.logs = state.get("logs", [])[-500:]
+            job.log_count = state.get("log_count", len(job.logs))
+            log_path = output_dir / "process.log"
+            if not log_path.exists() and job.logs:
+                log_path.write_text("".join(_log_line(job_id, entry) + "\n" for entry in job.logs),
+                                    encoding="utf-8")
             completed = state.get("status") == "completed" and (
                 (output_dir / "graph.json").exists() if config.mode == "build" else
                 all((output_dir / f"sft_{fmt}.json").exists() for fmt in FORMATS))
@@ -257,7 +329,8 @@ class JobManager:
             job.progress = 100 if completed else state.get("progress", 0)
             job.current = len(items) if completed else state.get("current", 0)
             job.total = len(items) if completed else state.get("total", 0)
-            job.error = None if completed else "任务因服务重启而中断，请重新提交。"
+            job.error = None if completed else (state.get("error") if state.get("status") == "failed"
+                                                 else "任务因服务重启而中断，请重新提交。")
             graph_path = output_dir / "graph.json"
             if graph_path.exists():
                 graph = MilitaryGraph.load(graph_path)
@@ -268,9 +341,8 @@ class JobManager:
                 subgraphs = json.loads(subgraphs_path.read_text(encoding="utf-8"))
                 job.semantic_subgraphs = sum(s["strategy"] != "atomic_fact" for s in subgraphs)
                 job.atomic_subgraphs = len(subgraphs) - job.semantic_subgraphs
-            if not job.logs:
-                job.note("已从本地任务文件恢复运行结果。", stage=job.stage,
-                         progress=job.progress)
+            if not completed and state.get("status") in {"queued", "running"}:
+                job.note(job.error, level="error", stage="failed", progress=job.progress)
             return job
         except (OSError, ValueError, KeyError, TypeError):
             return None
@@ -292,6 +364,8 @@ class JobManager:
         try:
             with job.lock:
                 job.status = "running"
+            job.note("任务开始，正在准备数据源与模型。",
+                     stage="graph" if config.mode == "generate" else "reading", progress=1)
             if config.storage == "neo4j":
                 store = self._neo4j(config, neo4j_password)
             if config.mode == "generate":
@@ -540,9 +614,26 @@ async def create_job(file: UploadFile | None = File(None), config: str = Form(..
     return {"id": job.id, "status": job.status}
 
 
+@app.get("/api/jobs")
+def recent_jobs(limit: int = 30) -> dict:
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=400, detail="无效任务数量")
+    return {"jobs": manager.list_jobs(limit)}
+
+
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
     return manager.get(job_id).snapshot()
+
+
+@app.get("/api/jobs/{job_id}/logs")
+def download_logs(job_id: str) -> FileResponse:
+    job = manager.get(job_id)
+    path = job.output_dir / "process.log"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="当前任务还没有日志文件")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=f"milkg_{job.id[:8]}.log")
 
 
 @app.get("/api/jobs/{job_id}/items")

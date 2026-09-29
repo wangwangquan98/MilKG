@@ -1,4 +1,8 @@
 import json
+import io
+import logging
+import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -46,6 +50,7 @@ def test_web_job_processes_upload_and_exports(tmp_path):
     assert (job.output_dir / "sft_sharegpt.json").exists()
     assert (job.output_dir / "sft_chatml.json").exists()
     assert (job.output_dir / "job_state.json").exists()
+    assert (job.output_dir / "process.log").exists()
     restored = web.JobManager(tmp_path).get(job.id)
     assert restored.status == "completed"
     assert restored.snapshot()["item_count"] == 1
@@ -64,6 +69,65 @@ def test_web_job_processes_upload_and_exports(tmp_path):
                            files={"file": ("source.exe", b"bad")}).status_code == 400
     finally:
         web.manager = original
+
+
+def test_running_job_is_listed_and_logs_survive_browser_reopen(tmp_path, request):
+    console = io.StringIO()
+    handler = logging.StreamHandler(console)
+    web.job_logger.addHandler(handler)
+    request.addfinalizer(lambda: web.job_logger.removeHandler(handler))
+    manager = web.JobManager(tmp_path)
+    job = manager.create("source.txt", b"sample", web.RunConfig(mode="build"),
+                         "secret", start=False)
+    with job.lock:
+        job.status = "running"
+    job.note("片段 2/9：正在抽取实体。", stage="extracting", progress=17,
+             current=2, total=9)
+    assert "2/9" in console.getvalue()
+    assert "片段 2/9" in (job.output_dir / "process.log").read_text(encoding="utf-8")
+    original = web.manager
+    web.manager = manager
+    try:
+        client = TestClient(web.app)
+        listed = client.get("/api/jobs").json()["jobs"]
+        assert listed[0]["id"] == job.id and listed[0]["status"] == "running"
+        state = client.get(f"/api/jobs/{job.id}").json()
+        assert state["stage"] == "extracting" and state["progress"] == 17
+        assert state["current"] == 2 and state["total"] == 9
+        assert client.get(f"/api/jobs/{job.id}/logs").status_code == 200
+    finally:
+        web.manager = original
+
+    restarted = web.JobManager(tmp_path)
+    restored = restarted.get(job.id)
+    assert restored.status == "failed"
+    assert "服务重启" in restored.error
+    assert any("服务重启" in entry["message"] for entry in restored.logs)
+    assert "服务重启" in (job.output_dir / "process.log").read_text(encoding="utf-8")
+
+
+def test_model_wait_heartbeat_reports_still_running(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "MODEL_HEARTBEAT_SECONDS", 0.02)
+    job = web.JobManager(tmp_path).create("source.txt", b"sample",
+                                         web.RunConfig(mode="build"), "", start=False)
+    release = threading.Event()
+
+    class SlowModel:
+        def complete(self, system, user, temperature):
+            release.wait(1)
+            return {"ok": True}
+
+    result = []
+    worker = threading.Thread(target=lambda: result.append(
+        web.CheckedModel(SlowModel(), job).complete("system", "user", 0.1)))
+    worker.start()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not any("模型请求仍在进行" in item["message"] for item in job.logs):
+        time.sleep(0.01)
+    release.set()
+    worker.join(timeout=1)
+    assert result == [{"ok": True}]
+    assert any("模型请求仍在进行" in item["message"] for item in job.logs)
 
 
 def test_web_rejects_invalid_endpoint_and_chunk_window():

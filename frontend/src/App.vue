@@ -32,6 +32,9 @@ const graphListLoading = ref(false)
 const graphListError = ref('')
 const graphMigrationMessage = ref('')
 const graphMigrationLoading = ref(false)
+const recentJobs = ref([])
+const recentJobsLoading = ref(false)
+const recentJobsError = ref('')
 const showKey = ref(false)
 const file = ref(null)
 const fileInput = ref(null)
@@ -50,8 +53,10 @@ const selectedType = ref('all')
 const expanded = ref(-1)
 const logPanel = ref(null)
 let timer = null
+let refreshingId = null
 
-const isBusy = computed(() => submitting.value || ['queued', 'running'].includes(job.value?.status))
+const isBusy = computed(() => submitting.value || (!!job.value?.id && !job.value?.status) ||
+  ['queued', 'running'].includes(job.value?.status))
 const canStart = computed(() => (config.mode === 'generate' || !!file.value) && !!health.value?.ok &&
   !isBusy.value && (config.mode === 'build' || config.question_types.length > 0) &&
   (config.storage !== 'neo4j' || (config.graph_action === 'new' && config.mode !== 'generate') || !!config.graph_id))
@@ -138,7 +143,9 @@ async function api(path, options) {
   if (!response.ok) {
     let detail = null
     try { detail = (await response.json()).detail } catch { /* server may return text */ }
-    throw new Error(errorMessage(detail) || `HTTP ${response.status}`)
+    const error = new Error(errorMessage(detail) || `HTTP ${response.status}`)
+    error.status = response.status
+    throw error
   }
   return response.json()
 }
@@ -162,27 +169,69 @@ async function loadItems() {
     requestError.value = error.message
   }
 }
-async function refreshJob() {
-  if (!job.value?.id) return
+async function loadRecentJobs() {
+  recentJobsLoading.value = true
   try {
-    const snapshot = await api(`/api/jobs/${job.value.id}`)
+    recentJobs.value = (await api('/api/jobs?limit=30')).jobs
+    recentJobsError.value = ''
+  } catch (error) {
+    recentJobsError.value = error.message
+  } finally {
+    recentJobsLoading.value = false
+  }
+}
+async function refreshJob() {
+  const id = job.value?.id
+  if (!id || refreshingId === id) return false
+  refreshingId = id
+  try {
+    const snapshot = await api(`/api/jobs/${id}`)
+    if (job.value?.id !== id) return false
     const countChanged = snapshot.item_count !== job.value.item_count
     job.value = snapshot
+    const recent = recentJobs.value.find(entry => entry.id === id)
+    if (recent) Object.assign(recent, { status: snapshot.status, stage: snapshot.stage,
+      progress: snapshot.progress, updated_at: snapshot.updated_at })
+    requestError.value = ''
     if (countChanged || snapshot.status === 'completed') await loadItems()
     if (!['queued', 'running'].includes(snapshot.status)) stopPolling()
+    return true
   } catch (error) {
+    if (job.value?.id !== id) return false
     requestError.value = error.message
-    stopPolling()
+    if (error.status === 404) {
+      stopPolling()
+      localStorage.removeItem('milkg_job_id')
+      sessionStorage.removeItem('milkg_job_id')
+      job.value = null
+    }
+    return false
+  } finally {
+    if (refreshingId === id) refreshingId = null
   }
 }
 function stopPolling() {
   if (timer) clearInterval(timer)
   timer = null
 }
-function startPolling() {
+function startPolling(immediate = true) {
   stopPolling()
-  refreshJob()
+  if (immediate) refreshJob()
   timer = setInterval(refreshJob, 1400)
+}
+async function openJob(id) {
+  if (!id) return
+  stopPolling()
+  items.value = []
+  itemTotal.value = 0
+  page.value = 0
+  expanded.value = -1
+  job.value = { id, item_count: -1, logs: [] }
+  localStorage.setItem('milkg_job_id', id)
+  await refreshJob()
+  if (job.value?.id === id && (!job.value.status || ['queued', 'running'].includes(job.value.status))) {
+    startPolling(false)
+  }
 }
 async function startJob() {
   if (!canStart.value) return
@@ -205,7 +254,8 @@ async function startJob() {
     itemTotal.value = 0
     expanded.value = -1
     job.value = { id: created.id, status: created.status, stage: 'queued', progress: 0, logs: [], item_count: 0 }
-    sessionStorage.setItem('milkg_job_id', created.id)
+    localStorage.setItem('milkg_job_id', created.id)
+    await loadRecentJobs()
     startPolling()
   } catch (error) {
     requestError.value = error.message
@@ -217,6 +267,13 @@ function download(format = config.output_format) {
   if (job.value?.status !== 'completed') return
   window.location.href = `/api/jobs/${job.value.id}/download?format=${encodeURIComponent(format)}`
 }
+function downloadLog() {
+  if (job.value?.id) window.location.href = `/api/jobs/${job.value.id}/logs`
+}
+function recentJobLabel(entry) {
+  const status = entry.status === 'completed' ? '完成' : entry.status === 'failed' ? '失败' : '运行中'
+  return `${new Date(entry.updated_at || entry.created_at).toLocaleString('zh-CN')} · ${entry.filename || entry.id.slice(0, 8)} · ${status} ${entry.progress ?? 0}%`
+}
 function displayAnswer(answer) {
   return Array.isArray(answer) ? answer.join('、') : answer
 }
@@ -227,18 +284,16 @@ watch(page, loadItems)
 watch(() => config.mode, mode => { if (mode === 'generate') { config.storage = 'neo4j'; config.graph_action = 'extend' } })
 watch(() => config.storage, storage => { if (storage === 'json') { config.graph_action = 'new'; config.graph_id = null } })
 watch(selectedType, () => { if (page.value) page.value = 0; else loadItems(); expanded.value = -1 })
-watch(() => job.value?.logs?.length, async () => {
+watch([() => job.value?.id, () => job.value?.logs?.length], async () => {
   await nextTick()
   if (logPanel.value) logPanel.value.scrollTop = logPanel.value.scrollHeight
 })
 onMounted(async () => {
   await checkHealth()
-  const id = sessionStorage.getItem('milkg_job_id')
-  if (id) {
-    job.value = { id, item_count: -1 }
-    await refreshJob()
-    if (['queued', 'running'].includes(job.value?.status)) startPolling()
-  }
+  await loadRecentJobs()
+  const id = localStorage.getItem('milkg_job_id') || sessionStorage.getItem('milkg_job_id')
+  if (id) await openJob(id)
+  if (!job.value && recentJobs.value.length) await openJob(recentJobs.value[0].id)
 })
 onUnmounted(stopPolling)
 </script>
@@ -320,14 +375,15 @@ onUnmounted(stopPolling)
 
         <div class="right-column">
           <div class="panel progress-panel"><div class="panel-heading"><div><span class="section-no">02 / PROCESS</span><h2>运行进度</h2></div><span class="status-chip" :class="job?.status || 'idle'"><i></i>{{ job ? (job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : '运行中') : '等待开始' }}</span></div>
+            <div class="task-switcher"><label for="recent-job">近期任务</label><select id="recent-job" :value="job?.id || ''" @change="openJob($event.target.value)"><option value="">选择任务</option><option v-for="entry in recentJobs" :key="entry.id" :value="entry.id">{{ recentJobLabel(entry) }}</option></select><button type="button" :disabled="recentJobsLoading" @click="loadRecentJobs">{{ recentJobsLoading ? '读取中…' : '刷新' }}</button></div><p v-if="recentJobsError" class="task-switcher-error">{{ recentJobsError }}</p>
             <div class="progress-display"><div><span class="progress-caption">CURRENT STAGE</span><h3>{{ job ? stageNames[job.stage] || '处理中' : '准备就绪' }}</h3><p>{{ job?.status === 'failed' ? job.error : job ? `${job.filename || '文档'} · ${progressLabel}` : '上传文档并设置参数，开始构建数据集。' }}</p></div><div class="progress-number">{{ job?.progress ?? 0 }}<small>%</small></div></div>
             <div class="progress-track"><div :style="{ width: `${job?.progress ?? 0}%` }"></div></div>
             <div class="milestones"><div v-for="(name, index) in stageMilestones" :key="name" :class="{ reached: currentStageIndex >= index, active: currentStageIndex === index }"><i></i><span>{{ name }}</span></div></div>
             <div v-if="job?.graph_nodes" class="graph-metrics"><span><b>{{ job.graph_nodes }}</b> 节点</span><span><b>{{ job.graph_edges }}</b> 关系边</span><span><b>{{ job.semantic_subgraphs }}</b> 语义子图</span><span><b>{{ job.atomic_subgraphs }}</b> 单跳事实</span></div><p v-if="job?.graph_id" class="graph-id">Neo4j 图谱 ID：{{ job.graph_id }}</p>
           </div>
 
-          <div class="panel log-panel"><div class="panel-heading"><div><span class="section-no">03 / ACTIVITY</span><h2>运行日志</h2></div><span class="log-count">{{ job?.logs?.length || 0 }} EVENTS</span></div>
-            <div ref="logPanel" class="terminal"><div class="terminal-bar"><span class="terminal-dots"><i></i><i></i><i></i></span><span>milkg / process.log</span><span>● LIVE</span></div><div class="terminal-body"><div v-if="!job?.logs?.length" class="terminal-empty"><span>▍</span>等待任务启动，日志将显示在这里。</div><div v-for="(entry, index) in job?.logs || []" :key="index" class="log-line" :class="entry.level"><time>{{ timeOnly(entry.time) }}</time><span class="log-symbol">{{ entry.level === 'error' ? '×' : entry.level === 'warning' ? '!' : '›' }}</span><span>{{ entry.message }}</span></div></div></div>
+          <div class="panel log-panel"><div class="panel-heading"><div><span class="section-no">03 / ACTIVITY</span><h2>运行日志</h2></div><div class="log-actions"><span class="log-count">{{ job?.log_count ?? job?.logs?.length ?? 0 }} EVENTS</span><button type="button" :disabled="!job?.id" @click="downloadLog">下载完整日志</button></div></div>
+            <div class="terminal"><div class="terminal-bar"><span class="terminal-dots"><i></i><i></i><i></i></span><span>milkg / process.log</span><span>{{ ['queued', 'running'].includes(job?.status) ? '● LIVE' : '● SAVED' }}</span></div><div ref="logPanel" class="terminal-body"><div v-if="!job?.logs?.length" class="terminal-empty"><span>▍</span>等待任务启动，日志将显示在这里。</div><div v-for="(entry, index) in job?.logs || []" :key="index" class="log-line" :class="entry.level"><time>{{ timeOnly(entry.time) }}</time><span class="log-symbol">{{ entry.level === 'error' ? '×' : entry.level === 'warning' ? '!' : '›' }}</span><span>{{ entry.message }}</span></div></div></div>
           </div>
         </div>
       </section>
