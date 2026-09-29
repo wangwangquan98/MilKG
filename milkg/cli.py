@@ -143,6 +143,7 @@ def _generate(args, output: Path, kg: MilitaryGraph) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MilKG-QA paper reproduction")
     parser.add_argument("command", choices=("build", "traverse", "generate", "run", "graphs", "augment-specs",
+                                            "migrate-neo4j",
                                             "prepare-extractor", "evaluate-extractor",
                                             "evaluate-traversal", "evaluate-qa"))
     parser.add_argument("inputs", nargs="*", type=Path, help="TXT, MD, PDF, DOCX files or directories")
@@ -200,6 +201,16 @@ def main(argv: list[str] | None = None) -> int:
             store.close()
         _write_json(args.output / "graphs.json", graphs)
         print(json.dumps(graphs, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "migrate-neo4j":
+        if args.store != "neo4j" or not args.graph_id:
+            parser.error("migrate-neo4j requires --store neo4j and --graph-id")
+        store = _neo4j(args)
+        try:
+            result = store.migrate_graph(args.graph_id)
+        finally:
+            store.close()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "prepare-extractor":
         if not args.annotations:

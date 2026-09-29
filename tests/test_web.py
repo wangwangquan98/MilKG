@@ -156,6 +156,11 @@ def test_web_api_lists_graphs_and_accepts_generate_without_file(tmp_path):
         def list_graphs(self):
             return [{"id": "graph-1", "name": "资料库", "node_count": 2, "edge_count": 1}]
 
+        def migrate_graph(self, graph_id):
+            assert graph_id == "graph-1"
+            return {"graph_id": graph_id, "tagged_nodes": 2, "converted_relations": 1,
+                    "node_count": 2, "edge_count": 1}
+
         def close(self):
             pass
 
@@ -165,6 +170,8 @@ def test_web_api_lists_graphs_and_accepts_generate_without_file(tmp_path):
         client = TestClient(web.app)
         listed = client.post("/api/graphs/list", json={"password": "secret"})
         assert listed.status_code == 200 and listed.json()["graphs"][0]["id"] == "graph-1"
+        migrated = client.post("/api/graphs/migrate", json={"password": "secret", "graph_id": "graph-1"})
+        assert migrated.status_code == 200 and migrated.json()["converted_relations"] == 1
         config = web.RunConfig(mode="generate", storage="neo4j", graph_id="graph-1")
         created = client.post("/api/jobs", data={"config": config.model_dump_json(),
                                                  "api_key": "qwen-key", "neo4j_password": "secret"})

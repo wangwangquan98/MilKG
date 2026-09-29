@@ -116,7 +116,22 @@ $graphId = (Get-Content output/build1/graph_ref.json -Raw | ConvertFrom-Json).gr
 ./.venv/Scripts/python -m milkg.cli generate --store neo4j --graph-id $graphId --output output/sft --disable-thinking --include-atomic --format alpaca
 ```
 
-`graph_ref.json` 保存逻辑图谱 ID；`graph.json` 是当次快照。Neo4j 中的 `MilKGEntity` 节点通过 `MILKG_RELATION` 关系相连，关系类别保存在 `relation_type` 属性；`MilKGDocument` 和 `MENTIONED_IN` 保存文档来源。所有对象带 `graph_id`，可按图谱 ID 查询跨文档实体与关系。重复读取相同文档时，文档 ID 由内容哈希确定，来源不会重复累计。
+`graph_ref.json` 保存逻辑图谱 ID；`graph.json` 是当次快照。Neo4j 实体同时带 `MilKGEntity` 和具体实体类别标签，例如 `` `Weapon System` ``；知识关系直接使用 12 类关系名称作为 Neo4j 类型，例如 `` `Equip-Carry` ``。节点仍保留 `entity_type` 属性，关系仍保留 `relation_type` 属性。`MilKGGraph` 是图谱元数据，`MilKGDocument` 和 `MENTIONED_IN` 保存文档来源，它们不属于 14 类实体和 12 类知识关系。所有对象带 `graph_id`，可按图谱 ID 查询跨文档实体与关系。重复读取相同文档时，文档 ID 由内容哈希确定，来源不会重复累计。
+
+旧版本保存的图谱可在 WebUI 中选择“只生成 SFT”或“扩展已有图谱”，读取图谱列表，选中目标图谱后点击“更新旧图谱的实体与关系分类”。该操作不调用模型，不重新抽取，也不改变实体、关系和文档来源数量；重复点击不会产生重复关系。也可以运行：
+
+```powershell
+./.venv/Scripts/python -m milkg.cli migrate-neo4j --store neo4j --graph-id YOUR_GRAPH_ID
+```
+
+迁移后刷新 Neo4j Browser。Browser 仅列出图中实际存在的本体类别，不一定同时出现全部 14 类实体和 12 类关系。类别名含空格、斜杠或连字符时，Cypher 查询需要使用反引号：
+
+```cypher
+MATCH (n:`Weapon System`)-[r:`Weapon-Spec`]->(s:`Technical Specification`)
+RETURN n, r, s LIMIT 25
+```
+
+后续扩展旧图谱时也会自动升级其分类。
 
 也可运行 `./.venv/Scripts/python -m milkg.cli graphs --store neo4j --output output/graphs` 列出已有图谱。以下 Cypher 可在 Neo4j Browser 中按图谱 ID 查询实体及其文档来源：
 

@@ -30,6 +30,8 @@ const neo4jPassword = ref('')
 const graphList = ref([])
 const graphListLoading = ref(false)
 const graphListError = ref('')
+const graphMigrationMessage = ref('')
+const graphMigrationLoading = ref(false)
 const showKey = ref(false)
 const file = ref(null)
 const fileInput = ref(null)
@@ -85,6 +87,23 @@ async function loadGraphs() {
     graphListError.value = error.message
   } finally {
     graphListLoading.value = false
+  }
+}
+
+async function migrateGraph() {
+  if (!config.graph_id) return
+  graphMigrationLoading.value = true
+  graphMigrationMessage.value = ''
+  graphListError.value = ''
+  try {
+    const result = await api('/api/graphs/migrate', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uri: config.neo4j_uri, user: config.neo4j_user,
+        password: neo4jPassword.value, database: config.neo4j_database, graph_id: config.graph_id }) })
+    graphMigrationMessage.value = `分类已更新：${result.tagged_nodes} 个实体标签，${result.converted_relations} 条关系类型。请刷新 Neo4j Browser。`
+  } catch (error) {
+    graphListError.value = error.message
+  } finally {
+    graphMigrationLoading.value = false
   }
 }
 
@@ -269,7 +288,7 @@ onUnmounted(stopPolling)
               <div class="neo4j-grid"><div><label class="sub-label" for="neo4j-user">用户名</label><input id="neo4j-user" v-model.trim="config.neo4j_user" placeholder="neo4j" /></div><div><label class="sub-label" for="neo4j-password">密码 <span class="optional">留空读取 MILKG_NEO4J_PASSWORD</span></label><input id="neo4j-password" v-model="neo4jPassword" type="password" autocomplete="off" /></div></div>
               <div v-if="config.mode !== 'generate'" class="storage-selector graph-action"><label><input v-model="config.graph_action" type="radio" value="new" />新建逻辑图谱</label><label><input v-model="config.graph_action" type="radio" value="extend" />扩展已有图谱</label></div>
               <div v-if="config.graph_action === 'new' && config.mode !== 'generate'"><label class="sub-label" for="graph-name">新图谱名称</label><input id="graph-name" v-model.trim="config.graph_name" placeholder="例如：轻武器资料库" /></div>
-              <div v-else><div class="graph-list-head"><label class="sub-label" for="graph-id">已有图谱</label><button type="button" :disabled="graphListLoading" @click="loadGraphs">{{ graphListLoading ? '读取中…' : '读取图谱列表 ↗' }}</button></div><select id="graph-id" v-model="config.graph_id" class="graph-select"><option :value="null">请选择图谱</option><option v-for="graph in graphList" :key="graph.id" :value="graph.id">{{ graph.name }} · {{ graph.node_count }} 节点 / {{ graph.edge_count }} 关系</option></select><p v-if="graphListError" class="form-error">{{ graphListError }}</p></div>
+              <div v-else><div class="graph-list-head"><label class="sub-label" for="graph-id">已有图谱</label><button type="button" :disabled="graphListLoading" @click="loadGraphs">{{ graphListLoading ? '读取中…' : '读取图谱列表 ↗' }}</button></div><select id="graph-id" v-model="config.graph_id" class="graph-select"><option :value="null">请选择图谱</option><option v-for="graph in graphList" :key="graph.id" :value="graph.id">{{ graph.name }} · {{ graph.node_count }} 节点 / {{ graph.edge_count }} 关系</option></select><button type="button" :disabled="!config.graph_id || graphMigrationLoading || isBusy" @click="migrateGraph">{{ graphMigrationLoading ? '更新分类中…' : '更新旧图谱的实体与关系分类' }}</button><p v-if="graphMigrationMessage" class="field-hint">{{ graphMigrationMessage }}</p><p v-if="graphListError" class="form-error">{{ graphListError }}</p></div>
               <span class="field-hint">密码仅用于本次连接。新建图谱不会清空已有数据；扩展会合并实体及来源。</span>
             </template>
           </div>

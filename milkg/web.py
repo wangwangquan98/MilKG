@@ -472,6 +472,10 @@ class GraphListRequest(BaseModel):
         return value
 
 
+class GraphMigrateRequest(GraphListRequest):
+    graph_id: str = Field(min_length=1)
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True, "env_api_key_available": bool(os.getenv("ALIYUN_API_KEY")),
@@ -490,6 +494,20 @@ def list_graphs(request: GraphListRequest) -> dict:
     except Exception as exc:
         message = str(exc).replace(password, "[REDACTED]") if password else str(exc)
         raise HTTPException(status_code=400, detail=f"Neo4j 连接失败：{message[:300]}") from exc
+
+
+@app.post("/api/graphs/migrate")
+def migrate_graph(request: GraphMigrateRequest) -> dict:
+    password = request.password or os.getenv("MILKG_NEO4J_PASSWORD", "")
+    try:
+        store = Neo4jGraphStore(request.uri, request.user, password, request.database)
+        try:
+            return store.migrate_graph(request.graph_id)
+        finally:
+            store.close()
+    except Exception as exc:
+        message = str(exc).replace(password, "[REDACTED]") if password else str(exc)
+        raise HTTPException(status_code=400, detail=f"图谱分类更新失败：{message[:300]}") from exc
 
 
 @app.post("/api/jobs", status_code=202)
