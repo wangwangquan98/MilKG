@@ -7,6 +7,12 @@ import urllib.request
 import time
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import urlparse
+
+
+def is_local_endpoint(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
 
 
 class ChatModel(Protocol):

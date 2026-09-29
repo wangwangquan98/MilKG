@@ -23,7 +23,7 @@ from .augmentation import materialize_specifications
 from .documents import load_chunks
 from .extraction import extract_chunk
 from .graph import MilitaryGraph
-from .llm import ChatModel, OpenAICompatibleModel
+from .llm import ChatModel, OpenAICompatibleModel, is_local_endpoint
 from .neo4j_store import Neo4jGraphStore, document_rows
 from .qa import QUESTION_TYPES, export_sft, generate_qa
 from .traversal import atomic_facts, traverse
@@ -276,8 +276,10 @@ class JobManager:
             return None
 
     def _model(self, config: RunConfig, name: str, api_key: str, job: Job) -> CheckedModel:
+        local = is_local_endpoint(config.api_url)
         return CheckedModel(OpenAICompatibleModel(config.api_url, name, api_key,
-                                                   enable_thinking=False), job)
+                                                   timeout=300 if local else 90,
+                                                   enable_thinking=None if local else False), job)
 
     def _neo4j(self, config: RunConfig, password: str) -> Neo4jGraphStore:
         return Neo4jGraphStore(config.neo4j_uri, config.neo4j_user,
@@ -518,8 +520,9 @@ async def create_job(file: UploadFile | None = File(None), config: str = Form(..
         settings = RunConfig.model_validate_json(config)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"参数无效：{exc}") from exc
-    secret = api_key.strip() or os.getenv("ALIYUN_API_KEY", "").strip()
-    if not secret:
+    local = is_local_endpoint(settings.api_url)
+    secret = api_key.strip() or ("" if local else os.getenv("ALIYUN_API_KEY", "").strip())
+    if not secret and not local:
         raise HTTPException(status_code=400, detail="请填写 API Key，或配置 ALIYUN_API_KEY")
     if settings.mode == "generate":
         filename, content = f"Neo4j 图谱 {settings.graph_id}", None

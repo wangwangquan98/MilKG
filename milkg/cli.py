@@ -8,7 +8,7 @@ from pathlib import Path
 from .documents import load_chunks
 from .extraction import extract_chunk
 from .graph import MilitaryGraph
-from .llm import OpenAICompatibleModel
+from .llm import OpenAICompatibleModel, is_local_endpoint
 from .qa import QUESTION_TYPES, export_sft, generate_qa
 from .traversal import traverse, atomic_facts
 from .training import evaluate_extractions, prepare_extractor_sft, read_json_array
@@ -24,8 +24,10 @@ def _model(args, role: str) -> OpenAICompatibleModel:
     key = getattr(args, f"{role}_key", None) or os.getenv(f"MILKG_{role.upper()}_KEY", "")
     if not url or not name:
         raise ValueError(f"Set --{role}-url and --{role}-model or MILKG_{role.upper()}_URL/MODEL")
+    local = is_local_endpoint(url)
     return OpenAICompatibleModel(url, name, key, json_mode=not args.no_json_mode,
-                                 enable_thinking=False if args.disable_thinking else None)
+                                 timeout=300 if local else 90,
+                                 enable_thinking=False if args.disable_thinking and not local else None)
 
 
 def _synonyms(path: Path | None) -> dict[str, str]:

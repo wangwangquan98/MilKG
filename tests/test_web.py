@@ -145,6 +145,30 @@ def test_web_requires_neo4j_graph_for_standalone_generation():
             pass
 
 
+def test_web_local_ollama_accepts_empty_key_and_omits_provider_options(tmp_path, monkeypatch):
+    monkeypatch.delenv("ALIYUN_API_KEY", raising=False)
+    manager = web.JobManager(tmp_path)
+    manager.executor.submit = lambda *args: None
+    config = web.RunConfig(mode="build", api_url="http://127.0.0.1:11434/v1")
+    original = web.manager
+    web.manager = manager
+    try:
+        client = TestClient(web.app)
+        response = client.post("/api/jobs", data={"config": config.model_dump_json()},
+                               files={"file": ("source.txt", b"sample text")})
+        assert response.status_code == 202
+        job = manager.get(response.json()["id"])
+        model = manager._model(config, "qwen3.5:4b", "", job).client
+        assert model.api_key == "" and model.timeout == 300
+        assert model.enable_thinking is None and model.json_mode
+        cloud = web.RunConfig(mode="build")
+        rejected = client.post("/api/jobs", data={"config": cloud.model_dump_json()},
+                               files={"file": ("source.txt", b"sample text")})
+        assert rejected.status_code == 400
+    finally:
+        web.manager = original
+
+
 def test_web_api_lists_graphs_and_accepts_generate_without_file(tmp_path):
     manager = web.JobManager(tmp_path)
     manager.executor.submit = lambda *args: None

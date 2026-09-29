@@ -294,16 +294,16 @@ onUnmounted(stopPolling)
           </div>
 
           <div class="divider"></div>
-          <div class="field-block"><div class="field-head"><label>API 接入</label><span>阿里云百炼 / Qwen</span></div>
+          <div class="field-block"><div class="field-head"><label>API 接入</label><span>阿里云百炼 / 本机 Ollama</span></div>
             <label class="sub-label" for="api-url">服务地址</label><input id="api-url" v-model.trim="config.api_url" type="url" spellcheck="false" />
-            <label class="sub-label" for="api-key">API Key <span class="optional">留空读取 ALIYUN_API_KEY</span></label>
+            <label class="sub-label" for="api-key">API Key <span class="optional">本机 Ollama 可留空；阿里云留空读取 ALIYUN_API_KEY</span></label>
             <div class="key-wrap"><input id="api-key" v-model="apiKey" :type="showKey ? 'text' : 'password'" autocomplete="off" placeholder="sk-... 或使用环境变量" /><button type="button" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button></div>
             <span class="field-hint">仅用于当前任务请求；界面不会保存密钥。</span>
           </div>
 
           <div class="divider"></div>
           <div class="field-block"><div class="field-head"><label>模型配置</label><span>按任务启用</span></div>
-            <div class="model-grid" :class="{ single: config.mode !== 'run' }"><div v-if="config.mode !== 'generate'"><label class="sub-label" for="extract-model">实体关系提取</label><input id="extract-model" v-model.trim="config.extract_model" list="extract-models" placeholder="qwen3.5-flash" /><datalist id="extract-models"><option value="qwen3.5-flash" /><option value="qwen-plus" /><option value="qwen-turbo" /></datalist></div><div v-if="config.mode !== 'build'"><label class="sub-label" for="generate-model">问答合成</label><input id="generate-model" v-model.trim="config.generate_model" list="generate-models" placeholder="qwen3.5-plus" /><datalist id="generate-models"><option value="qwen3.5-plus" /><option value="qwen-max" /><option value="qwen-plus" /></datalist></div></div>
+            <div class="model-grid" :class="{ single: config.mode !== 'run' }"><div v-if="config.mode !== 'generate'"><label class="sub-label" for="extract-model">实体关系提取</label><input id="extract-model" v-model.trim="config.extract_model" list="extract-models" placeholder="qwen3.5-flash" /><datalist id="extract-models"><option value="qwen3.5-flash" /><option value="qwen-plus" /><option value="qwen-turbo" /><option value="qwen3.5:4b" /></datalist></div><div v-if="config.mode !== 'build'"><label class="sub-label" for="generate-model">问答合成</label><input id="generate-model" v-model.trim="config.generate_model" list="generate-models" placeholder="qwen3.5-plus" /><datalist id="generate-models"><option value="qwen3.5-plus" /><option value="qwen-max" /><option value="qwen-plus" /><option value="qwen3.5:9b" /></datalist></div></div>
             <div v-if="config.mode !== 'generate'" class="temp-row"><label for="extract-temp">提取温度 <b>{{ Number(config.extract_temperature).toFixed(1) }}</b></label><input id="extract-temp" v-model.number="config.extract_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
             <div v-if="config.mode !== 'build'" class="temp-row"><label for="generate-temp">合成温度 <b>{{ Number(config.generate_temperature).toFixed(1) }}</b></label><input id="generate-temp" v-model.number="config.generate_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
           </div>

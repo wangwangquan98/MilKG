@@ -8,7 +8,7 @@
 | --- | --- |
 | Python 后端与命令行 | Python 3.10 或更高版本 |
 | WebUI 构建 | Node.js 22.18 或更高版本、npm |
-| 在线生成 | 可调用的 OpenAI 兼容聊天模型 API 与 API Key；默认配置使用阿里云百炼 Qwen |
+| 模型推理 | 可调用的 OpenAI 兼容聊天模型 API；默认配置使用阿里云百炼 Qwen，服务器本机的 Ollama 无需 API Key |
 | 跨文档图谱 | Neo4j 服务及其 Bolt 地址、用户名和密码；本地 JSON 模式无需 Neo4j |
 
 Python 依赖由 `pyproject.toml` 管理：
@@ -43,6 +43,21 @@ cd ..
 ./.venv/Scripts/python -m pip install -e ".[documents]"
 ```
 
+Linux 服务器已经 `git clone` 项目时，在仓库目录运行：
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install --upgrade pip setuptools
+./.venv/bin/python -m pip install -e '.[documents,web,neo4j]'
+cd frontend
+npm ci
+npm run build
+cd ..
+./.venv/bin/python -m milkg.web
+```
+
+服务仍默认监听服务器的 `127.0.0.1:8000`。在自己的电脑上访问服务器 WebUI，可另开终端建立 SSH 端口转发：`ssh -L 8000:127.0.0.1:8000 用户名@服务器地址`，再打开本机的 `http://127.0.0.1:8000`。仅使用命令行时无需 Node.js 和前端构建。
+
 ## 使用 WebUI
 
 启动本地服务：
@@ -54,7 +69,7 @@ cd ..
 浏览器打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。服务默认只监听本机 `127.0.0.1`。
 
 1. 选择“构图并生成”“只构建图谱”或“只生成 SFT”。构图任务上传 TXT、MD、PDF 或 DOCX 文件，单文件上限为 20 MB；独立生成任务无需上传文件。
-2. 填写 API Key，或在启动服务前设置环境变量 `ALIYUN_API_KEY`。页面填写的 Key 只用于当前任务，不写入任务配置或数据集。
+2. 调用阿里云时填写 API Key，或在启动服务前设置环境变量 `ALIYUN_API_KEY`；连接服务器本机的 Ollama 时可留空。页面填写的 Key 只用于当前任务，不写入任务配置或数据集。
 3. 选择本地 JSON 或 Neo4j 存储。使用 Neo4j 时填写 Bolt 地址、数据库、用户名和密码；构图选择“新建逻辑图谱”或“扩展已有图谱”。扩展或独立生成时点击“读取图谱列表”并选择目标图谱。
 4. 设置当前阶段所需的模型、温度和高级参数，启动任务并查看日志。
 5. 生成任务完成后下载 Alpaca、ShareGPT 或 ChatML JSON。只构图任务不生成 SFT，页面会显示图谱 ID，可供下次扩展或独立生成。
@@ -95,6 +110,30 @@ $env:MILKG_GENERATE_KEY = $env:ALIYUN_API_KEY
 
 `run` 接受一个或多个文档或目录。上例生成 `output/run/sft_alpaca.json`。如需其他格式，使用 `--format sharegpt` 或 `--format chatml`。命令行不会自动读取 `ALIYUN_API_KEY`；示例中明确将它赋给抽取和生成所需的两个变量。
 
+### 服务器本机 Ollama
+
+MilKG 使用 Ollama 的 [OpenAI 兼容 `/v1/chat/completions` 接口](https://github.com/ollama/ollama/blob/main/docs/api/openai-compatibility.mdx)，并默认请求 JSON 对象格式。先在 Linux 服务器确认 Ollama 服务运行，再拉取并列出模型。下面的 `qwen3.5:4b` 和 `qwen3.5:9b` 是[官方模型库中的示例标签](https://ollama.com/library/qwen3.5/tags)；按服务器内存、显存和 `ollama list` 的实际结果替换即可。
+
+```bash
+ollama pull qwen3.5:4b
+ollama pull qwen3.5:9b
+ollama list
+curl http://127.0.0.1:11434/api/tags
+```
+
+命令行的抽取与生成模型可以分别指定；本机 Ollama 无需设置 `MILKG_EXTRACT_KEY` 或 `MILKG_GENERATE_KEY`：
+
+```bash
+export MILKG_EXTRACT_URL='http://127.0.0.1:11434/v1'
+export MILKG_EXTRACT_MODEL='qwen3.5:4b'
+export MILKG_GENERATE_URL='http://127.0.0.1:11434/v1'
+export MILKG_GENERATE_MODEL='qwen3.5:9b'
+./.venv/bin/python -m milkg.cli build ./docs/batch1 --store neo4j --graph-action extend --graph-id YOUR_GRAPH_ID --output output/build1
+./.venv/bin/python -m milkg.cli generate --store neo4j --graph-id YOUR_GRAPH_ID --output output/sft --include-atomic --format alpaca
+```
+
+WebUI 中将“服务地址”设为 `http://127.0.0.1:11434/v1`，实体关系提取模型和问答合成模型分别填入 `ollama list` 中的完整名称，API Key 留空即可。此处的 `127.0.0.1` 指运行 MilKG 后端的 Linux 服务器；即使浏览器通过 SSH 转发打开，模型请求仍由服务器发出。若只想试运行，不使用已有图谱，可在命令行执行 `run ./your_document.txt --output output/run`，或在 WebUI 选择本地 JSON 存储。Ollama 返回慢于默认在线模型时，本地接口的单次请求超时为 300 秒。若所用模型不支持 JSON 响应格式，可在命令行加 `--no-json-mode`，但模型仍须自行输出可解析的 JSON；WebUI 默认要求 JSON 格式。
+
 ### Neo4j 跨文档图谱
 
 先准备 Neo4j 服务。已有服务时直接使用其 Bolt 地址；若使用 Docker，可参照 [Neo4j 官方 Docker 指南](https://neo4j.com/docs/operations-manual/current/docker/introduction/)创建持久化卷并启动容器：
@@ -132,6 +171,41 @@ RETURN n, r, s LIMIT 25
 ```
 
 后续扩展旧图谱时也会自动升级其分类。
+
+### 从 Windows 本机迁移 Neo4j 到 Linux 服务器
+
+`migrate-neo4j` 只更新**同一个数据库内**的实体标签和关系类型；跨机器搬运图谱使用 Neo4j 的 `database dump/load`。此方式迁移整个 `neo4j` 数据库，包含所有 MilKG 逻辑图谱、原有 `graph_id`、实体、关系、文档来源、约束与索引；项目代码和 `output/` 不会随数据库转移。Neo4j 官方要求 Community 版在[离线状态 dump](https://neo4j.com/docs/operations-manual/current/backup-restore/offline-backup/)和[离线状态 load](https://neo4j.com/docs/operations-manual/current/backup-restore/restore-dump/)。先确认两端 Neo4j 版本兼容，优先使用相同版本。
+
+1. 在 Windows 本机停止 Neo4j。若使用 Neo4j Desktop，在对应 DBMS 的安装目录 `bin` 打开终端；若使用 ZIP 安装，进入 `<NEO4J_HOME>\bin`。在 PowerShell 中执行（将目录换成自己的可写路径）：
+
+   ```powershell
+   New-Item -ItemType Directory -Force D:\neo4j-export
+   .\neo4j-admin database dump neo4j --to-path=D:\neo4j-export
+   Set-Location D:\neo4j-export
+   scp .\neo4j.dump 用户名@服务器地址:/tmp/neo4j.dump
+   ```
+
+2. Linux 服务器上先停止 Neo4j。以下示例适用于 Debian/RPM 的 systemd 安装；若是压缩包安装，把 `neo4j-admin` 换为 `<NEO4J_HOME>/bin/neo4j-admin`。`--overwrite-destination=true` 会**替换服务器现有 `neo4j` 数据库**；服务器已有需要保留的数据时，先为它另做备份。
+
+   ```bash
+   sudo systemctl stop neo4j
+   sudo install -d -o neo4j -g neo4j -m 700 /var/lib/neo4j/milkg-import
+   sudo install -o neo4j -g neo4j -m 600 /tmp/neo4j.dump /var/lib/neo4j/milkg-import/neo4j.dump
+   sudo -u neo4j neo4j-admin database load neo4j --from-path=/var/lib/neo4j/milkg-import --overwrite-destination=true
+   sudo systemctl start neo4j
+   ```
+
+3. 在服务器上设置 Neo4j 连接环境变量并检查图谱目录；`YOUR_GRAPH_ID` 仍是 Windows 本机原来的图谱 ID，可从原有 `graph_ref.json` 或 Neo4j 的 `MilKGGraph` 节点查到。
+
+   ```bash
+   export MILKG_NEO4J_URI='bolt://127.0.0.1:7687'
+   export MILKG_NEO4J_USER='neo4j'
+   read -rs -p 'Neo4j password: ' MILKG_NEO4J_PASSWORD; echo
+   export MILKG_NEO4J_PASSWORD
+   ./.venv/bin/python -m milkg.cli graphs --store neo4j --output output/graphs
+   ```
+
+只迁移 `neo4j` 数据库时，服务器上 Neo4j 的账户和密码仍由服务器自身管理，需使用服务器原有登录凭据；[官方 dump 不包含用户和角色元数据](https://neo4j.com/docs/operations-manual/current/backup-restore/offline-backup/)。若服务器已有图谱且希望与本机图谱合并，整库 `load` 不适用，因为它会替换目标数据库。
 
 也可运行 `./.venv/Scripts/python -m milkg.cli graphs --store neo4j --output output/graphs` 列出已有图谱。以下 Cypher 可在 Neo4j Browser 中按图谱 ID 查询实体及其文档来源：
 
