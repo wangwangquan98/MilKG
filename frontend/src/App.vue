@@ -32,12 +32,17 @@ const graphListLoading = ref(false)
 const graphListError = ref('')
 const graphMigrationMessage = ref('')
 const graphMigrationLoading = ref(false)
+const modelList = ref([])
+const modelListLoading = ref(false)
+const modelListError = ref('')
 const recentJobs = ref([])
 const recentJobsLoading = ref(false)
 const recentJobsError = ref('')
 const showKey = ref(false)
-const file = ref(null)
+const selectedFiles = ref([])
 const fileInput = ref(null)
+const folderInput = ref(null)
+const uploadMessage = ref('')
 const dragging = ref(false)
 const advanced = ref(false)
 const health = ref(null)
@@ -57,7 +62,7 @@ let refreshingId = null
 
 const isBusy = computed(() => submitting.value || (!!job.value?.id && !job.value?.status) ||
   ['queued', 'running'].includes(job.value?.status))
-const canStart = computed(() => (config.mode === 'generate' || !!file.value) && !!health.value?.ok &&
+const canStart = computed(() => (config.mode === 'generate' || selectedFiles.value.length > 0) && !!health.value?.ok &&
   !isBusy.value && (config.mode === 'build' || config.question_types.length > 0) &&
   (config.storage !== 'neo4j' || (config.graph_action === 'new' && config.mode !== 'generate') || !!config.graph_id))
 const currentStageIndex = computed(() => {
@@ -78,6 +83,25 @@ const currentStageIndex = computed(() => {
   return -1
 })
 const progressLabel = computed(() => job.value?.total ? `${job.value.current} / ${job.value.total}` : '— / —')
+const selectedBytes = computed(() => selectedFiles.value.reduce((sum, entry) => sum + entry.file.size, 0))
+const modelOptions = computed(() => modelList.value.length ? modelList.value :
+  ['qwen3.5-flash', 'qwen3.5-plus', 'qwen-plus', 'qwen-max', 'qwen3.5:4b', 'qwen3.5:9b'])
+
+async function refreshModels() {
+  const apiUrl = config.api_url
+  modelListLoading.value = true
+  modelListError.value = ''
+  try {
+    const result = await api('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_url: apiUrl, api_key: apiKey.value.trim() }) })
+    if (config.api_url === apiUrl) modelList.value = result.models
+  } catch (error) {
+    modelList.value = []
+    modelListError.value = error.message
+  } finally {
+    modelListLoading.value = false
+  }
+}
 
 async function loadGraphs() {
   graphListLoading.value = true
@@ -112,24 +136,65 @@ async function migrateGraph() {
   }
 }
 
-function chooseFile(candidate) {
-  if (!candidate) return
-  const extension = candidate.name.split('.').pop()?.toLowerCase()
-  if (!['txt', 'md', 'pdf', 'docx'].includes(extension)) {
-    requestError.value = '仅支持 TXT、MD、PDF、DOCX 文件。'
+function addFiles(candidates) {
+  const allowed = new Set(['txt', 'md', 'pdf', 'docx'])
+  const existing = new Set(selectedFiles.value.map(entry => `${entry.name}\0${entry.file.size}\0${entry.file.lastModified}`))
+  const next = [...selectedFiles.value]
+  let skipped = 0
+  for (const entry of candidates) {
+    const extension = entry.name.split('.').pop()?.toLowerCase()
+    if (!allowed.has(extension) || !entry.file.size || entry.file.size > 20 * 1024 * 1024) {
+      skipped++
+      continue
+    }
+    const key = `${entry.name}\0${entry.file.size}\0${entry.file.lastModified}`
+    if (!existing.has(key)) { next.push(entry); existing.add(key) }
+  }
+  const bytes = next.reduce((sum, entry) => sum + entry.file.size, 0)
+  if (next.length > 200 || bytes > 200 * 1024 * 1024) {
+    uploadMessage.value = '每批最多 200 份文档，总大小不能超过 200 MB。'
     return
   }
-  if (candidate.size > 20 * 1024 * 1024) {
-    requestError.value = '文件不能超过 20 MB。'
-    return
-  }
-  file.value = candidate
+  selectedFiles.value = next
+  uploadMessage.value = skipped ? `已跳过 ${skipped} 份不支持、空白或超过 20 MB 的文件。` : ''
   requestError.value = ''
 }
-function onDrop(event) {
-  dragging.value = false
-  chooseFile(event.dataTransfer?.files?.[0])
+function onPicked(event) {
+  const entries = Array.from(event.target.files || []).map(file =>
+    ({ file, name: file.webkitRelativePath || file.name }))
+  addFiles(entries)
+  event.target.value = ''
 }
+async function filesFromEntry(entry) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject))
+    return [{ file, name: entry.fullPath.replace(/^\//, '') || file.name }]
+  }
+  if (!entry.isDirectory) return []
+  const reader = entry.createReader()
+  const children = []
+  while (true) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject))
+    if (!batch.length) break
+    children.push(...batch)
+  }
+  const nested = await Promise.all(children.map(filesFromEntry))
+  return nested.flat()
+}
+async function onDrop(event) {
+  dragging.value = false
+  try {
+    const entries = Array.from(event.dataTransfer?.items || [])
+      .map(item => item.webkitGetAsEntry?.()).filter(Boolean)
+    const candidates = entries.length
+      ? (await Promise.all(entries.map(filesFromEntry))).flat()
+      : Array.from(event.dataTransfer?.files || []).map(file => ({ file, name: file.name }))
+    addFiles(candidates)
+  } catch (error) {
+    uploadMessage.value = `读取拖入的文件夹失败：${error.message}`
+  }
+}
+function removeFile(index) { selectedFiles.value.splice(index, 1); uploadMessage.value = '' }
 function formatSize(size) {
   return size < 1024 * 1024 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`
 }
@@ -243,7 +308,9 @@ async function startJob() {
   submitting.value = true
   try {
     const data = new FormData()
-    if (config.mode !== 'generate') data.append('file', file.value)
+    if (config.mode !== 'generate') {
+      for (const entry of selectedFiles.value) data.append('files', entry.file, entry.name)
+    }
     data.append('config', JSON.stringify(config))
     data.append('api_key', apiKey.value.trim())
     data.append('neo4j_password', neo4jPassword.value)
@@ -283,6 +350,7 @@ function timeOnly(value) {
 watch(page, loadItems)
 watch(() => config.mode, mode => { if (mode === 'generate') { config.storage = 'neo4j'; config.graph_action = 'extend' } })
 watch(() => config.storage, storage => { if (storage === 'json') { config.graph_action = 'new'; config.graph_id = null } })
+watch(() => config.api_url, () => { modelList.value = []; modelListError.value = '' })
 watch(selectedType, () => { if (page.value) page.value = 0; else loadItems(); expanded.value = -1 })
 watch([() => job.value?.id, () => job.value?.logs?.length], async () => {
   await nextTick()
@@ -327,12 +395,15 @@ onUnmounted(stopPolling)
           </div>
 
           <div v-if="config.mode !== 'generate'" class="field-block">
-            <div class="field-head"><label>原始文档</label><span>≤ 20 MB</span></div>
-            <div class="upload-zone" :class="{ dragging, filled: file }" tabindex="0" role="button" aria-label="上传文档" @click="fileInput?.click()" @keydown.enter="fileInput?.click()" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
-              <input ref="fileInput" type="file" accept=".txt,.md,.pdf,.docx" hidden @change="chooseFile($event.target.files?.[0])" />
-              <template v-if="file"><span class="file-icon">TXT</span><span class="file-detail"><strong>{{ file.name }}</strong><small>{{ formatSize(file.size) }} · 点击更换文件</small></span><span class="upload-arrow">↗</span></template>
-              <template v-else><span class="upload-symbol">↥</span><strong>点击选择或拖入文档</strong><small>支持 TXT / MD / PDF / DOCX</small></template>
+            <div class="field-head"><label>原始文档</label><span>单文件 ≤ 20 MB</span></div>
+            <div class="upload-zone" :class="{ dragging }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
+              <span class="upload-symbol">↥</span><strong>拖入多个文件或文件夹</strong><small>支持 TXT / MD / PDF / DOCX；一批最多 200 份、共 200 MB</small>
             </div>
+            <input ref="fileInput" type="file" accept=".txt,.md,.pdf,.docx" multiple hidden @change="onPicked" />
+            <input ref="folderInput" type="file" webkitdirectory directory multiple hidden @change="onPicked" />
+            <div class="upload-actions"><button type="button" @click="fileInput?.click()">选择文件</button><button type="button" @click="folderInput?.click()">选择文件夹</button><button v-if="selectedFiles.length" type="button" @click="selectedFiles = []; uploadMessage = ''">清空</button></div>
+            <div v-if="selectedFiles.length" class="upload-selection"><strong>已选择 {{ selectedFiles.length }} 份 · {{ formatSize(selectedBytes) }}</strong><ul><li v-for="(entry, index) in selectedFiles" :key="`${entry.name}-${index}`"><span :title="entry.name">{{ entry.name }}</span><small>{{ formatSize(entry.file.size) }}</small><button type="button" :aria-label="`移除 ${entry.name}`" @click="removeFile(index)">×</button></li></ul></div>
+            <p v-if="uploadMessage" class="form-error">{{ uploadMessage }}</p>
           </div>
 
           <div class="divider"></div>
@@ -358,7 +429,10 @@ onUnmounted(stopPolling)
 
           <div class="divider"></div>
           <div class="field-block"><div class="field-head"><label>模型配置</label><span>按任务启用</span></div>
-            <div class="model-grid" :class="{ single: config.mode !== 'run' }"><div v-if="config.mode !== 'generate'"><label class="sub-label" for="extract-model">实体关系提取</label><input id="extract-model" v-model.trim="config.extract_model" list="extract-models" placeholder="qwen3.5-flash" /><datalist id="extract-models"><option value="qwen3.5-flash" /><option value="qwen-plus" /><option value="qwen-turbo" /><option value="qwen3.5:4b" /></datalist></div><div v-if="config.mode !== 'build'"><label class="sub-label" for="generate-model">问答合成</label><input id="generate-model" v-model.trim="config.generate_model" list="generate-models" placeholder="qwen3.5-plus" /><datalist id="generate-models"><option value="qwen3.5-plus" /><option value="qwen-max" /><option value="qwen-plus" /><option value="qwen3.5:9b" /></datalist></div></div>
+            <div class="model-list-head"><span>从当前服务地址读取可用模型</span><button type="button" :disabled="modelListLoading" @click="refreshModels">{{ modelListLoading ? '读取中…' : '刷新模型列表 ↗' }}</button></div>
+            <p v-if="modelList.length" class="field-hint">已读取 {{ modelList.length }} 个模型；点击输入框可选择，也可手动输入。</p><p v-if="modelListError" class="form-error">{{ modelListError }}</p>
+            <div class="model-grid" :class="{ single: config.mode !== 'run' }"><div v-if="config.mode !== 'generate'"><label class="sub-label" for="extract-model">实体关系提取</label><input id="extract-model" v-model.trim="config.extract_model" list="available-models" placeholder="qwen3.5-flash" /></div><div v-if="config.mode !== 'build'"><label class="sub-label" for="generate-model">问答合成</label><input id="generate-model" v-model.trim="config.generate_model" list="available-models" placeholder="qwen3.5-plus" /></div></div>
+            <datalist id="available-models"><option v-for="name in modelOptions" :key="name" :value="name" /></datalist>
             <div v-if="config.mode !== 'generate'" class="temp-row"><label for="extract-temp">提取温度 <b>{{ Number(config.extract_temperature).toFixed(1) }}</b></label><input id="extract-temp" v-model.number="config.extract_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
             <div v-if="config.mode !== 'build'" class="temp-row"><label for="generate-temp">合成温度 <b>{{ Number(config.generate_temperature).toFixed(1) }}</b></label><input id="generate-temp" v-model.number="config.generate_temperature" type="range" min="0" max="1.5" step="0.1" /></div>
           </div>

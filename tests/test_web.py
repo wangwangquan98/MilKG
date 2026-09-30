@@ -274,3 +274,72 @@ def test_web_api_lists_graphs_and_accepts_generate_without_file(tmp_path):
         assert False
     except ValueError:
         pass
+
+
+def test_web_batch_upload_builds_one_graph_and_restores_sources(tmp_path, monkeypatch):
+    manager = web.JobManager(tmp_path)
+    manager.executor.submit = lambda *args: None
+    manager._model = lambda *args: object()
+
+    def fake_extract(chunk, *args, **kwargs):
+        subject = "甲平台" if "甲" in chunk.text else "乙平台"
+        weapon = "甲武器" if "甲" in chunk.text else "乙武器"
+        return {"chunk_id": chunk.id,
+                "entities": [{"name": subject, "type": "Platform/Carrier", "chunk_id": chunk.id,
+                              "confidence": 1.0, "attributes": {}},
+                             {"name": weapon, "type": "Weapon System", "chunk_id": chunk.id,
+                              "confidence": 1.0, "attributes": {}}],
+                "relations": [{"source": subject, "target": weapon, "type": "Equip-Carry",
+                               "evidence": chunk.text, "chunk_id": chunk.id, "confidence": 1.0}],
+                "diagnostics": {}}
+
+    monkeypatch.setattr(web, "extract_chunk", fake_extract)
+    monkeypatch.setenv("ALIYUN_API_KEY", "batch-key")
+    original = web.manager
+    web.manager = manager
+    try:
+        config = web.RunConfig(mode="build", materialize_specs=False)
+        client = TestClient(web.app)
+        response = client.post("/api/jobs", data={"config": config.model_dump_json()},
+                               files=[("files", ("docs/part-a.txt", "甲平台搭载甲武器。".encode())),
+                                      ("files", ("part-b.txt", "乙平台搭载乙武器。".encode()))])
+        assert response.status_code == 202
+        job = manager.get(response.json()["id"])
+        assert job.snapshot()["file_count"] == 2
+        assert job.snapshot()["sources"] == ["docs/part-a.txt", "part-b.txt"]
+        manager.run(job, "batch-key")
+        assert job.status == "completed" and job.graph_nodes == 4 and job.graph_edges == 2
+        chunks = json.loads((job.output_dir / "chunks.json").read_text(encoding="utf-8"))
+        assert {row["source"] for row in chunks} == {"docs/part-a.txt", "part-b.txt"}
+        restored = web.JobManager(tmp_path).get(job.id)
+        assert restored.snapshot()["sources"] == ["docs/part-a.txt", "part-b.txt"]
+        assert len(restored.source_paths) == 2
+    finally:
+        web.manager = original
+
+
+def test_web_model_list_uses_aliyun_native_and_ollama_compatible_endpoints(monkeypatch):
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request.full_url, request.get_header("Authorization"), timeout))
+        if "api/v1/models" in request.full_url:
+            payload = {"output": {"total": 2, "models": [
+                {"model": "qwen3.5-flash"}, {"model": "qwen3.5-plus"}]}}
+        else:
+            payload = {"data": [{"id": "qwen3.5:4b"}, {"id": "qwen3.5:9b"}]}
+        return io.BytesIO(json.dumps(payload).encode())
+
+    monkeypatch.setattr(web.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("ALIYUN_API_KEY", "env-key")
+    client = TestClient(web.app)
+    cloud = client.post("/api/models", json={
+        "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"})
+    assert cloud.status_code == 200
+    assert cloud.json()["models"] == ["qwen3.5-flash", "qwen3.5-plus"]
+    assert requests[0][0].startswith("https://dashscope.aliyuncs.com/api/v1/models?")
+    assert requests[0][1] == "Bearer env-key"
+    local = client.post("/api/models", json={"api_url": "http://127.0.0.1:11434/v1"})
+    assert local.status_code == 200
+    assert local.json()["models"] == ["qwen3.5:4b", "qwen3.5:9b"]
+    assert requests[1] == ("http://127.0.0.1:11434/v1/models", None, 15)

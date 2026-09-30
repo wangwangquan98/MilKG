@@ -9,13 +9,14 @@ import re
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -23,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .augmentation import materialize_specifications
-from .documents import load_chunks
+from .documents import Chunk, load_chunks
 from .extraction import extract_chunk
 from .graph import MilitaryGraph
 from .llm import ChatModel, OpenAICompatibleModel, is_local_endpoint
@@ -35,6 +36,8 @@ from .traversal import atomic_facts, traverse
 ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_FILES = 200
+MAX_TOTAL_UPLOAD_BYTES = 200 * 1024 * 1024
 FORMATS = {"alpaca", "sharegpt", "chatml"}
 RELATION_REJECTION_LABELS = {
     "unknown_endpoint": "实体未通过校验",
@@ -65,6 +68,13 @@ def _write_json(path: Path, value: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def _display_name(value: str) -> str:
+    parts = [re.sub(r"[\x00-\x1f\x7f]", "", part).strip()
+             for part in value.replace("\\", "/").split("/")]
+    parts = [part for part in parts if part and part not in {".", ".."}]
+    return "/".join(parts) or "document.txt"
 
 
 class RunConfig(BaseModel):
@@ -144,6 +154,8 @@ class Job:
     source_path: Path | None
     output_dir: Path
     config: RunConfig
+    source_paths: list[Path] = field(default_factory=list)
+    source_names: list[str] = field(default_factory=list)
     status: str = "queued"
     stage: str = "queued"
     progress: int = 0
@@ -189,7 +201,9 @@ class Job:
 
     def snapshot(self) -> dict:
         with self.lock:
-            return {"id": self.id, "filename": self.filename, "status": self.status,
+            return {"id": self.id, "filename": self.filename,
+                    "sources": list(self.source_names), "file_count": len(self.source_paths),
+                    "status": self.status,
                     "stage": self.stage, "progress": self.progress,
                     "current": self.current, "total": self.total,
                     "created_at": self.created_at, "updated_at": self.updated_at,
@@ -240,19 +254,34 @@ class JobManager:
         self.lock = threading.RLock()
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="milkg-job")
 
-    def create(self, filename: str, content: bytes | None, config: RunConfig,
+    def create(self, filename: str, content: bytes | None | list[tuple[str, bytes]], config: RunConfig,
                api_key: str, start: bool = True, neo4j_password: str = "") -> Job:
         job_id = uuid.uuid4().hex
         output_dir = self.output_root / job_id
         output_dir.mkdir(parents=True)
-        source_path = None
-        if content is not None:
-            safe_name = re.sub(r"[^\w.\-]", "_", filename, flags=re.UNICODE).strip("._") or "document.txt"
-            source_path = output_dir / safe_name
-            source_path.write_bytes(content)
+        uploads = ([(filename, content)] if isinstance(content, bytes) else content) or []
+        source_paths, source_names, source_rows = [], [], []
+        if uploads:
+            upload_dir = output_dir / "uploads"
+            upload_dir.mkdir()
+            for index, (name, data) in enumerate(uploads, 1):
+                display_name = _display_name(name)
+                safe_name = re.sub(r"[^\w.\-]", "_", display_name.rsplit("/", 1)[-1],
+                                   flags=re.UNICODE).strip("._") or "document.txt"
+                stored_name = f"{index:04d}_{safe_name}"
+                source = upload_dir / stored_name
+                source.write_bytes(data)
+                source_paths.append(source)
+                source_names.append(display_name)
+                source_rows.append({"name": display_name, "stored_name": stored_name, "size": len(data)})
+            _write_json(output_dir / "sources.json", source_rows)
+        source_path = source_paths[0] if source_paths else None
         _write_json(output_dir / "config.json", config.model_dump())
-        job = Job(job_id, filename, source_path, output_dir, config)
-        job.note("图谱任务已创建，等待处理。" if config.mode == "generate" else "文件已接收，等待处理。")
+        title = f"{len(source_paths)} 份文档" if len(source_paths) > 1 else filename
+        job = Job(job_id, title, source_path, output_dir, config,
+                  source_paths=source_paths, source_names=source_names)
+        job.note("图谱任务已创建，等待处理。" if config.mode == "generate" else
+                 f"已接收 {len(source_paths)} 份文档，等待处理。")
         with self.lock:
             self.jobs[job_id] = job
         if start:
@@ -301,8 +330,19 @@ class JobManager:
             return None
         try:
             config = RunConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
-            source = next((path for path in output_dir.iterdir()
-                           if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS), None)
+            manifest = output_dir / "sources.json"
+            if manifest.exists():
+                source_rows = json.loads(manifest.read_text(encoding="utf-8"))
+                source_paths = [output_dir / "uploads" / row["stored_name"] for row in source_rows]
+                source_names = [row["name"] for row in source_rows]
+                if any(not path.is_file() or path.parent != output_dir / "uploads"
+                       for path in source_paths):
+                    return None
+            else:
+                source_paths = [path for path in output_dir.iterdir()
+                                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS]
+                source_names = [path.name for path in source_paths]
+            source = source_paths[0] if source_paths else None
             if source is None and config.mode != "generate":
                 return None
             state_path = output_dir / "job_state.json"
@@ -310,7 +350,8 @@ class JobManager:
             qa_path = output_dir / "qa.json"
             items = json.loads(qa_path.read_text(encoding="utf-8")) if qa_path.exists() else []
             job = Job(job_id, state.get("filename", source.name if source else "已有图谱"),
-                      source, output_dir, config)
+                      source, output_dir, config,
+                      source_paths=source_paths, source_names=source_names)
             job.graph_id = state.get("graph_id")
             job.items = items
             job.created_at = state.get("created_at", job.created_at)
@@ -378,16 +419,20 @@ class JobManager:
                 job.note(f"已载入图谱 {config.graph_id}。", stage="graph", progress=60)
             else:
                 job.note("读取文档并进行分块。", stage="reading", progress=2, current=0, total=0)
-                chunks = load_chunks([job.source_path], config.max_chars, config.overlap)
+                paths = job.source_paths or ([job.source_path] if job.source_path else [])
+                labels = {str(path): name for path, name in zip(paths, job.source_names)}
+                chunks = [Chunk(chunk.id, labels.get(chunk.source, chunk.source), chunk.text)
+                          for chunk in load_chunks(paths, config.max_chars, config.overlap)]
                 if not chunks:
                     raise ValueError("文档没有可提取的文本")
                 _write_json(job.output_dir / "chunks.json", [chunk.__dict__ for chunk in chunks])
-                job.note(f"完成分块，共 {len(chunks)} 个片段。", stage="extracting", progress=8,
+                job.note(f"完成 {len(paths)} 份文档的分块，共 {len(chunks)} 个片段。",
+                         stage="extracting", progress=8,
                          current=0, total=len(chunks))
                 extractor = self._model(config, config.extract_model, api_key, job)
                 extractions = []
                 for index, chunk in enumerate(chunks, 1):
-                    job.note(f"片段 {index}/{len(chunks)}：正在抽取实体。", stage="extracting")
+                    job.note(f"片段 {index}/{len(chunks)}（{chunk.source}）：正在抽取实体。", stage="extracting")
                     result = extract_chunk(chunk, extractor, config.min_confidence,
                                            config.extract_temperature,
                                            on_phase=lambda message, i=index: job.note(
@@ -552,10 +597,69 @@ class GraphMigrateRequest(GraphListRequest):
     graph_id: str = Field(min_length=1)
 
 
+class ModelListRequest(BaseModel):
+    api_url: str
+    api_key: str = ""
+
+    @field_validator("api_url")
+    @classmethod
+    def valid_api_url(cls, value: str) -> str:
+        return RunConfig.valid_api_url(value)
+
+
+def _fetch_models(api_url: str, api_key: str) -> list[str]:
+    aliyun = (urlparse(api_url).hostname or "").lower().endswith(".aliyuncs.com")
+    native = aliyun and api_url.endswith("/compatible-mode/v1")
+    endpoint = (api_url[:-len("/compatible-mode/v1")] + "/api/v1/models"
+                if native else api_url + "/models")
+    names: set[str] = set()
+    for page in range(1, 11):
+        url = endpoint + ("?" + urlencode({"capabilities": "TG", "page_no": page,
+                                           "page_size": 100}) if native else "")
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+        if native:
+            output = payload.get("output", {})
+            rows = output.get("models", [])
+            names.update(row["model"] for row in rows
+                         if isinstance(row, dict) and isinstance(row.get("model"), str))
+            page_size = output.get("page_size") or len(rows)
+            if not rows or page * page_size >= output.get("total", 0):
+                break
+        else:
+            rows = payload.get("data", [])
+            names.update(row["id"] for row in rows
+                         if isinstance(row, dict) and isinstance(row.get("id"), str))
+            break
+    if not names:
+        raise ValueError("服务未返回可用的文本模型；请检查地址、API Key 或手动填写模型名")
+    return sorted(names, key=str.casefold)
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True, "env_api_key_available": bool(os.getenv("ALIYUN_API_KEY")),
-            "supported_extensions": sorted(SUPPORTED_EXTENSIONS)}
+            "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
+            "max_upload_files": MAX_UPLOAD_FILES,
+            "max_upload_bytes": MAX_UPLOAD_BYTES,
+            "max_total_upload_bytes": MAX_TOTAL_UPLOAD_BYTES}
+
+
+@app.post("/api/models")
+def list_models(request: ModelListRequest) -> dict:
+    local = is_local_endpoint(request.api_url)
+    secret = request.api_key.strip() or ("" if local else os.getenv("ALIYUN_API_KEY", "").strip())
+    if not secret and not local:
+        raise HTTPException(status_code=400, detail="请填写 API Key，或配置 ALIYUN_API_KEY")
+    try:
+        return {"models": _fetch_models(request.api_url, secret)}
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        message = str(exc).replace(secret, "[REDACTED]") if secret else str(exc)
+        raise HTTPException(status_code=400, detail=f"读取模型列表失败：{message[:300]}") from exc
 
 
 @app.post("/api/graphs/list")
@@ -587,7 +691,8 @@ def migrate_graph(request: GraphMigrateRequest) -> dict:
 
 
 @app.post("/api/jobs", status_code=202)
-async def create_job(file: UploadFile | None = File(None), config: str = Form(...),
+async def create_job(file: UploadFile | None = File(None), files: list[UploadFile] | None = File(None),
+                     config: str = Form(...),
                      api_key: str = Form(default=""),
                      neo4j_password: str = Form(default="")) -> dict:
     try:
@@ -601,14 +706,27 @@ async def create_job(file: UploadFile | None = File(None), config: str = Form(..
     if settings.mode == "generate":
         filename, content = f"Neo4j 图谱 {settings.graph_id}", None
     else:
-        filename = file.filename if file else ""
-        if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
-            raise HTTPException(status_code=400, detail="仅支持 TXT、MD、PDF、DOCX")
-        content = await file.read(MAX_UPLOAD_BYTES + 1)
-        if not content:
-            raise HTTPException(status_code=400, detail="上传文件为空")
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="文件不能超过 20 MB")
+        uploads = list(files or []) + ([file] if file else [])
+        if not uploads:
+            raise HTTPException(status_code=400, detail="请上传至少一份文档")
+        if len(uploads) > MAX_UPLOAD_FILES:
+            raise HTTPException(status_code=413, detail=f"每批最多 {MAX_UPLOAD_FILES} 份文档")
+        content = []
+        total_bytes = 0
+        for upload in uploads:
+            name = _display_name(upload.filename or "")
+            if Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
+                raise HTTPException(status_code=400, detail=f"{name}：仅支持 TXT、MD、PDF、DOCX")
+            data = await upload.read(MAX_UPLOAD_BYTES + 1)
+            if not data:
+                raise HTTPException(status_code=400, detail=f"{name}：上传文件为空")
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"{name}：文件不能超过 20 MB")
+            total_bytes += len(data)
+            if total_bytes > MAX_TOTAL_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="本批文件总大小不能超过 200 MB")
+            content.append((name, data))
+        filename = content[0][0] if len(content) == 1 else f"{len(content)} 份文档"
     job = manager.create(filename, content, settings, secret,
                          neo4j_password=neo4j_password)
     return {"id": job.id, "status": job.status}
