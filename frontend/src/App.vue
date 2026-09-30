@@ -20,6 +20,7 @@ const config = reactive({
   api_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   extract_model: 'qwen3.5-flash', generate_model: 'qwen3.5-plus',
   extract_temperature: 0.1, generate_temperature: 0.7,
+  local_thinking: false, local_max_tokens: 4096,
   max_chars: 1800, overlap: 180, min_confidence: 0,
   max_subgraphs: 24, max_atomic: 24, per_subgraph: 1,
   include_atomic: true, materialize_specs: true,
@@ -84,6 +85,7 @@ const currentStageIndex = computed(() => {
 })
 const progressLabel = computed(() => job.value?.total ? `${job.value.current} / ${job.value.total}` : '— / —')
 const selectedBytes = computed(() => selectedFiles.value.reduce((sum, entry) => sum + entry.file.size, 0))
+const isLocalModel = computed(() => /^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(config.api_url))
 const modelOptions = computed(() => modelList.value.length ? modelList.value :
   ['qwen3.5-flash', 'qwen3.5-plus', 'qwen-plus', 'qwen-max', 'qwen3.5:4b', 'qwen3.5:9b'])
 
@@ -294,6 +296,11 @@ async function openJob(id) {
   job.value = { id, item_count: -1, logs: [] }
   localStorage.setItem('milkg_job_id', id)
   await refreshJob()
+  if (job.value?.resumable) {
+    config.api_url = job.value.api_url || config.api_url
+    config.local_thinking = !!job.value.local_thinking
+    config.local_max_tokens = job.value.local_max_tokens || 4096
+  }
   if (job.value?.id === id && (!job.value.status || ['queued', 'running'].includes(job.value.status))) {
     startPolling(false)
   }
@@ -322,6 +329,27 @@ async function startJob() {
     expanded.value = -1
     job.value = { id: created.id, status: created.status, stage: 'queued', progress: 0, logs: [], item_count: 0 }
     localStorage.setItem('milkg_job_id', created.id)
+    await loadRecentJobs()
+    startPolling()
+  } catch (error) {
+    requestError.value = error.message
+  } finally {
+    submitting.value = false
+  }
+}
+async function resumeJob() {
+  if (!job.value?.resumable || isBusy.value) return
+  requestError.value = ''
+  submitting.value = true
+  try {
+    const data = new FormData()
+    data.append('api_key', apiKey.value.trim())
+    data.append('neo4j_password', neo4jPassword.value)
+    data.append('local_thinking', String(config.local_thinking))
+    data.append('local_max_tokens', String(config.local_max_tokens))
+    await api(`/api/jobs/${job.value.id}/resume`, { method: 'POST', body: data })
+    apiKey.value = ''
+    job.value = { ...job.value, status: 'queued', stage: 'queued', error: null, resumable: false }
     await loadRecentJobs()
     startPolling()
   } catch (error) {
@@ -439,12 +467,12 @@ onUnmounted(stopPolling)
 
           <button class="advanced-toggle" type="button" :aria-expanded="advanced" @click="advanced = !advanced"><span>高级参数</span><span>{{ advanced ? '−' : '+' }}</span></button>
           <div v-if="advanced" class="advanced-content">
-            <div class="number-grid"><label v-if="config.mode !== 'generate'">分块字符数<input v-model.number="config.max_chars" type="number" min="400" max="8000" /></label><label v-if="config.mode !== 'generate'">重叠字符数<input v-model.number="config.overlap" type="number" min="0" max="1000" /></label><label v-if="config.mode !== 'build'">最多语义子图<input v-model.number="config.max_subgraphs" type="number" min="1" max="200" /></label><label v-if="config.mode !== 'build'">最多单跳事实<input v-model.number="config.max_atomic" type="number" min="0" max="100" /></label><label v-if="config.mode !== 'build'">每图生成次数<input v-model.number="config.per_subgraph" type="number" min="1" max="5" /></label><label v-if="config.mode !== 'generate'">最低置信度<input v-model.number="config.min_confidence" type="number" min="0" max="1" step="0.05" /></label></div>
+            <div class="number-grid"><label v-if="config.mode !== 'generate'">分块字符数<input v-model.number="config.max_chars" type="number" min="400" max="8000" /></label><label v-if="config.mode !== 'generate'">重叠字符数<input v-model.number="config.overlap" type="number" min="0" max="1000" /></label><label v-if="config.mode !== 'build'">最多语义子图<input v-model.number="config.max_subgraphs" type="number" min="1" max="200" /></label><label v-if="config.mode !== 'build'">最多单跳事实<input v-model.number="config.max_atomic" type="number" min="0" max="100" /></label><label v-if="config.mode !== 'build'">每图生成次数<input v-model.number="config.per_subgraph" type="number" min="1" max="5" /></label><label v-if="config.mode !== 'generate'">最低置信度<input v-model.number="config.min_confidence" type="number" min="0" max="1" step="0.05" /></label><label v-if="isLocalModel">本地模型最大输出 token<input v-model.number="config.local_max_tokens" type="number" min="512" max="16384" step="512" /></label></div>
             <p v-if="config.mode !== 'build'" class="advanced-hint">语义子图上限只限制多关系出题素材的数量；实际数量取决于图谱中的关系。单跳事实和技术规格需要在下方分别开启。</p>
             <div v-if="config.mode !== 'build'" class="advanced-line"><span>问答题型</span><div class="check-grid"><label v-for="(name, type) in typeNames" :key="type" class="check-option"><input v-model="config.question_types" type="checkbox" :value="type" />{{ name }}</label></div></div>
-            <div class="switch-line"><label v-if="config.mode !== 'build'"><input v-model="config.include_atomic" type="checkbox" />加入单跳事实</label><label v-if="config.mode !== 'generate'"><input v-model="config.materialize_specs" type="checkbox" />补充技术规格关系</label></div>
+            <div class="switch-line"><label v-if="config.mode !== 'build'"><input v-model="config.include_atomic" type="checkbox" />加入单跳事实</label><label v-if="config.mode !== 'generate'"><input v-model="config.materialize_specs" type="checkbox" />补充技术规格关系</label><label v-if="isLocalModel"><input v-model="config.local_thinking" type="checkbox" />使用本地模型默认思考模式</label></div>
           </div>
-          <div class="start-area"><button class="primary-button" :disabled="!canStart" @click="startJob"><span>{{ isBusy ? '任务运行中' : config.mode === 'build' ? '开始构建图谱' : config.mode === 'generate' ? '从图谱生成 SFT' : '开始生成数据集' }}</span><span>{{ isBusy ? '···' : '→' }}</span></button><p v-if="requestError" class="form-error">{{ requestError }}</p><p v-else>任务进度和结果会在右侧实时更新。</p></div>
+          <div class="start-area"><button class="primary-button" :disabled="!canStart" @click="startJob"><span>{{ isBusy ? '任务运行中' : config.mode === 'build' ? '开始构建图谱' : config.mode === 'generate' ? '从图谱生成 SFT' : '开始生成数据集' }}</span><span>{{ isBusy ? '···' : '→' }}</span></button><button v-if="job?.resumable" class="resume-button" type="button" :disabled="isBusy" @click="resumeJob">从已完成片段继续抽取 ↗</button><p v-if="requestError" class="form-error">{{ requestError }}</p><p v-else>任务进度和结果会在右侧实时更新。</p></div>
         </div>
 
         <div class="right-column">

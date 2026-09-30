@@ -225,6 +225,7 @@ def test_web_local_ollama_accepts_empty_key_and_omits_provider_options(tmp_path,
         model = manager._model(config, "qwen3.5:4b", "", job).client
         assert model.api_key == "" and model.timeout == 300
         assert model.enable_thinking is None and model.json_mode
+        assert model.reasoning_effort == "none" and model.max_tokens == 4096
         cloud = web.RunConfig(mode="build")
         rejected = client.post("/api/jobs", data={"config": cloud.model_dump_json()},
                                files={"file": ("source.txt", b"sample text")})
@@ -343,3 +344,70 @@ def test_web_model_list_uses_aliyun_native_and_ollama_compatible_endpoints(monke
     assert local.status_code == 200
     assert local.json()["models"] == ["qwen3.5:4b", "qwen3.5:9b"]
     assert requests[1] == ("http://127.0.0.1:11434/v1/models", None, 15)
+
+
+def test_failed_extraction_can_resume_without_repeating_completed_chunks(tmp_path, monkeypatch):
+    manager = web.JobManager(tmp_path)
+    manager._model = lambda *args: object()
+    calls = []
+    fail_once = True
+
+    def fake_extract(chunk, *args, **kwargs):
+        nonlocal fail_once
+        calls.append(chunk.id)
+        if "第二" in chunk.text and fail_once:
+            fail_once = False
+            raise RuntimeError("prediction aborted, token repeat limit reached")
+        return {"chunk_id": chunk.id, "entities": [], "relations": [], "diagnostics": {}}
+
+    monkeypatch.setattr(web, "extract_chunk", fake_extract)
+    config = web.RunConfig(mode="build", api_url="http://127.0.0.1:11434/v1",
+                           materialize_specs=False)
+    job = manager.create("2 份文档", [("first.txt", "第一份。".encode()),
+                                     ("second.txt", "第二份。".encode())],
+                         config, "", start=False)
+    manager.run(job, "")
+    assert job.status == "failed" and job.snapshot()["resumable"]
+    assert len(json.loads((job.output_dir / "extractions.json").read_text(encoding="utf-8"))) == 1
+    saved_config = json.loads((job.output_dir / "config.json").read_text(encoding="utf-8"))
+    saved_config.pop("local_thinking")
+    saved_config.pop("local_max_tokens")
+    (job.output_dir / "config.json").write_text(json.dumps(saved_config), encoding="utf-8")
+    restored = web.JobManager(tmp_path).get(job.id)
+    assert restored.snapshot()["resumable"]
+    resumed_manager = web.JobManager(tmp_path)
+    resumed_manager._model = lambda *args: object()
+    resumed = resumed_manager.get(job.id)
+    scheduled = []
+    resumed_manager.executor.submit = lambda *args: scheduled.append(args)
+    original = web.manager
+    web.manager = resumed_manager
+    try:
+        response = TestClient(web.app).post(f"/api/jobs/{job.id}/resume",
+                                            data={"local_max_tokens": "3072",
+                                                  "local_thinking": "true"})
+        assert response.status_code == 202
+        assert resumed.config.local_max_tokens == 3072 and resumed.config.local_thinking
+        assert len(scheduled) == 1
+        scheduled[0][0](*scheduled[0][1:])
+    finally:
+        web.manager = original
+    assert resumed.status == "completed"
+    assert len(calls) == 3 and calls[0] != calls[1] == calls[2]
+    assert not resumed.snapshot()["resumable"]
+
+
+def test_local_model_sends_bounded_output_and_disables_thinking(monkeypatch):
+    captured = []
+
+    def fake_urlopen(request, timeout):
+        captured.append(json.loads(request.data))
+        return io.BytesIO(json.dumps({"choices": [{"finish_reason": "stop",
+                                                   "message": {"content": "{}"}}]}).encode())
+
+    monkeypatch.setattr(web.urllib.request, "urlopen", fake_urlopen)
+    model = web.OpenAICompatibleModel("http://127.0.0.1:11434/v1", "qwen3.8:27b",
+                                      reasoning_effort="none", max_tokens=4096)
+    assert model.complete("system", "user", 0.1) == {}
+    assert captured[0]["reasoning_effort"] == "none"
+    assert captured[0]["max_tokens"] == 4096

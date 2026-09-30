@@ -42,6 +42,8 @@ class OpenAICompatibleModel:
     timeout: int = 90
     json_mode: bool = True
     enable_thinking: bool | None = None
+    reasoning_effort: str | None = None
+    max_tokens: int | None = None
 
     def complete(self, system: str, user: str, temperature: float) -> dict:
         url = self.base_url.rstrip("/")
@@ -56,6 +58,10 @@ class OpenAICompatibleModel:
             body["response_format"] = {"type": "json_object"}
         if self.enable_thinking is not None:
             body["enable_thinking"] = self.enable_thinking
+        if self.reasoning_effort is not None:
+            body["reasoning_effort"] = self.reasoning_effort
+        if self.max_tokens is not None:
+            body["max_tokens"] = self.max_tokens
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -65,7 +71,11 @@ class OpenAICompatibleModel:
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     result = json.load(response)
-                content = result["choices"][0]["message"]["content"]
+                choice = result["choices"][0]
+                if choice.get("finish_reason") == "length":
+                    raise RuntimeError(f"{self.model} 输出达到 max_tokens={self.max_tokens}；"
+                                       "请提高本地模型最大输出 token，或减小分块字符数")
+                content = choice["message"]["content"]
                 return parse_json_object(content)
             except urllib.error.HTTPError as exc:
                 detail = exc.read(500).decode("utf-8", "replace")

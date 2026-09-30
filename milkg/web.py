@@ -91,6 +91,8 @@ class RunConfig(BaseModel):
     generate_model: str = Field(default="qwen3.5-plus", min_length=1, max_length=100)
     extract_temperature: float = Field(default=0.1, ge=0.0, le=1.5)
     generate_temperature: float = Field(default=0.7, ge=0.0, le=1.5)
+    local_thinking: bool = False
+    local_max_tokens: int = Field(default=4096, ge=512, le=16384)
     max_chars: int = Field(default=1800, ge=400, le=8000)
     overlap: int = Field(default=180, ge=0, le=1000)
     min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -204,6 +206,10 @@ class Job:
             return {"id": self.id, "filename": self.filename,
                     "sources": list(self.source_names), "file_count": len(self.source_paths),
                     "status": self.status,
+                    "resumable": self.status == "failed" and self.graph_id is None
+                    and self.total > 0 and self.current < self.total
+                    and (self.output_dir / "chunks.json").exists()
+                    and not (self.output_dir / "graph.json").exists(),
                     "stage": self.stage, "progress": self.progress,
                     "current": self.current, "total": self.total,
                     "created_at": self.created_at, "updated_at": self.updated_at,
@@ -212,6 +218,9 @@ class Job:
                     "graph_nodes": self.graph_nodes, "graph_edges": self.graph_edges,
                     "graph_id": self.graph_id or self.config.graph_id,
                     "mode": self.config.mode, "storage": self.config.storage,
+                    "api_url": self.config.api_url,
+                    "local_thinking": self.config.local_thinking,
+                    "local_max_tokens": self.config.local_max_tokens,
                     "semantic_subgraphs": self.semantic_subgraphs,
                     "atomic_subgraphs": self.atomic_subgraphs,
                     "output_format": self.config.output_format}
@@ -288,6 +297,31 @@ class JobManager:
             self.executor.submit(self.run, job, api_key, neo4j_password)
         return job
 
+    def resume(self, job: Job, api_key: str, neo4j_password: str = "",
+               local_thinking: bool | None = None,
+               local_max_tokens: int | None = None) -> None:
+        with job.lock:
+            if not job.snapshot()["resumable"]:
+                raise HTTPException(status_code=409, detail="该任务没有可继续的抽取检查点")
+            if is_local_endpoint(job.config.api_url):
+                updates = {}
+                if local_thinking is not None:
+                    updates["local_thinking"] = local_thinking
+                if local_max_tokens is not None:
+                    updates["local_max_tokens"] = local_max_tokens
+                if updates:
+                    try:
+                        settings = RunConfig.model_validate({**job.config.model_dump(), **updates})
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=f"本地模型参数无效：{exc}") from exc
+                    job.config = settings
+                    _write_json(job.output_dir / "config.json", settings.model_dump())
+            job.status = "queued"
+            job.error = None
+        job.note(f"继续抽取任务已提交，将跳过前 {job.current} 个已完成片段。",
+                 stage="queued")
+        self.executor.submit(self.run, job, api_key, neo4j_password, True)
+
     def get(self, job_id: str) -> Job:
         with self.lock:
             job = self.jobs.get(job_id)
@@ -352,7 +386,8 @@ class JobManager:
             job = Job(job_id, state.get("filename", source.name if source else "已有图谱"),
                       source, output_dir, config,
                       source_paths=source_paths, source_names=source_names)
-            job.graph_id = state.get("graph_id")
+            job.graph_id = (state.get("graph_id") if (output_dir / "graph_ref.json").exists()
+                            or (output_dir / "graph.json").exists() else None)
             job.items = items
             job.created_at = state.get("created_at", job.created_at)
             job.updated_at = state.get("updated_at", job.created_at)
@@ -392,14 +427,18 @@ class JobManager:
         local = is_local_endpoint(config.api_url)
         return CheckedModel(OpenAICompatibleModel(config.api_url, name, api_key,
                                                    timeout=300 if local else 90,
-                                                   enable_thinking=None if local else False), job)
+                                                   enable_thinking=None if local else False,
+                                                   reasoning_effort=("none" if local and not config.local_thinking
+                                                                     else None),
+                                                   max_tokens=config.local_max_tokens if local else None), job)
 
     def _neo4j(self, config: RunConfig, password: str) -> Neo4jGraphStore:
         return Neo4jGraphStore(config.neo4j_uri, config.neo4j_user,
                                password or os.getenv("MILKG_NEO4J_PASSWORD", ""),
                                config.neo4j_database)
 
-    def run(self, job: Job, api_key: str, neo4j_password: str = "") -> None:
+    def run(self, job: Job, api_key: str, neo4j_password: str = "",
+            resume_extractions: bool = False) -> None:
         config = job.config
         store = None
         try:
@@ -425,13 +464,30 @@ class JobManager:
                           for chunk in load_chunks(paths, config.max_chars, config.overlap)]
                 if not chunks:
                     raise ValueError("文档没有可提取的文本")
+                if resume_extractions and (job.output_dir / "chunks.json").exists():
+                    saved_chunks = json.loads((job.output_dir / "chunks.json").read_text(encoding="utf-8"))
+                    if [row.get("id") for row in saved_chunks] != [chunk.id for chunk in chunks]:
+                        raise ValueError("文档分块与原任务不一致，无法继续抽取")
                 _write_json(job.output_dir / "chunks.json", [chunk.__dict__ for chunk in chunks])
                 job.note(f"完成 {len(paths)} 份文档的分块，共 {len(chunks)} 个片段。",
                          stage="extracting", progress=8,
                          current=0, total=len(chunks))
                 extractor = self._model(config, config.extract_model, api_key, job)
-                extractions = []
+                if resume_extractions:
+                    checkpoint = job.output_dir / "extractions.json"
+                    extractions = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else []
+                    if (not isinstance(extractions, list) or len(extractions) > len(chunks)
+                            or any(not isinstance(row, dict) or row.get("chunk_id") != chunks[i].id
+                                   for i, row in enumerate(extractions))):
+                        raise ValueError("抽取检查点与当前文档分块不匹配，无法继续")
+                    job.note(f"已载入 {len(extractions)} 个片段的抽取结果，继续处理剩余片段。",
+                             stage="extracting", current=len(extractions), total=len(chunks),
+                             progress=8 + round(42 * len(extractions) / len(chunks)))
+                else:
+                    extractions = []
                 for index, chunk in enumerate(chunks, 1):
+                    if index <= len(extractions):
+                        continue
                     job.note(f"片段 {index}/{len(chunks)}（{chunk.source}）：正在抽取实体。", stage="extracting")
                     result = extract_chunk(chunk, extractor, config.min_confidence,
                                            config.extract_temperature,
@@ -742,6 +798,20 @@ def recent_jobs(limit: int = 30) -> dict:
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
     return manager.get(job_id).snapshot()
+
+
+@app.post("/api/jobs/{job_id}/resume", status_code=202)
+def resume_job(job_id: str, api_key: str = Form(default=""),
+               neo4j_password: str = Form(default=""),
+               local_thinking: bool | None = Form(default=None),
+               local_max_tokens: int | None = Form(default=None)) -> dict:
+    job = manager.get(job_id)
+    local = is_local_endpoint(job.config.api_url)
+    secret = api_key.strip() or ("" if local else os.getenv("ALIYUN_API_KEY", "").strip())
+    if not secret and not local:
+        raise HTTPException(status_code=400, detail="请填写 API Key，或配置 ALIYUN_API_KEY")
+    manager.resume(job, secret, neo4j_password, local_thinking, local_max_tokens)
+    return {"id": job.id, "status": job.status}
 
 
 @app.get("/api/jobs/{job_id}/logs")
