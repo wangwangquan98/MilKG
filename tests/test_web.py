@@ -6,7 +6,8 @@ import time
 
 from fastapi.testclient import TestClient
 
-from milkg import web
+from milkg import llm, web
+from milkg.llm import RequestCancelled
 
 
 def test_web_job_processes_upload_and_exports(tmp_path):
@@ -128,6 +129,60 @@ def test_model_wait_heartbeat_reports_still_running(tmp_path, monkeypatch):
     worker.join(timeout=1)
     assert result == [{"ok": True}]
     assert any("模型请求仍在进行" in item["message"] for item in job.logs)
+
+
+def test_cancel_running_job_stops_model_and_preserves_status(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingModel:
+        def complete(self, system, user, temperature):
+            entered.set()
+            release.wait(3)
+            return {"entities": [], "relations": []}
+
+        def cancel(self):
+            release.set()
+
+    manager = web.JobManager(tmp_path)
+    manager._model = lambda *args: web.CheckedModel(BlockingModel(), args[-1])
+    job = manager.create("source.txt", b"sample", web.RunConfig(mode="build"),
+                         "", start=True)
+    assert entered.wait(3)
+    original = web.manager
+    web.manager = manager
+    try:
+        response = TestClient(web.app).post(f"/api/jobs/{job.id}/cancel")
+        assert response.status_code == 202
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and job.status != "cancelled":
+            time.sleep(0.01)
+        assert job.status == "cancelled"
+        assert TestClient(web.app).get(f"/api/jobs/{job.id}").json()["status"] == "cancelled"
+        assert TestClient(web.app).post(f"/api/jobs/{job.id}/cancel").status_code == 409
+        assert "任务已中断" in (job.output_dir / "process.log").read_text(encoding="utf-8")
+        assert not (job.output_dir / "graph.json").exists()
+        assert web.JobManager(tmp_path).get(job.id).status == "cancelled"
+    finally:
+        web.manager = original
+        release.set()
+        manager.executor.shutdown(wait=True)
+
+
+def test_cancel_queued_job_does_not_start(tmp_path):
+    release = threading.Event()
+    manager = web.JobManager(tmp_path, max_workers=1)
+    blocker = manager.executor.submit(release.wait, 3)
+    job = manager.create("source.txt", b"sample", web.RunConfig(mode="build"),
+                         "", start=True)
+    try:
+        manager.cancel(job)
+        assert job.status == "cancelled" and job.future.cancelled()
+        assert not (job.output_dir / "chunks.json").exists()
+    finally:
+        release.set()
+        blocker.result(timeout=3)
+        manager.executor.shutdown(wait=True)
 
 
 def test_web_rejects_invalid_endpoint_and_chunk_window():
@@ -411,3 +466,46 @@ def test_local_model_sends_bounded_output_and_disables_thinking(monkeypatch):
     assert model.complete("system", "user", 0.1) == {}
     assert captured[0]["reasoning_effort"] == "none"
     assert captured[0]["max_tokens"] == 4096
+
+
+def test_cancel_closes_active_local_model_connection(monkeypatch):
+    entered = threading.Event()
+    closed = threading.Event()
+
+    class Socket:
+        def shutdown(self, how):
+            closed.set()
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            self.sock = Socket()
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            entered.set()
+            closed.wait(3)
+            raise OSError("connection closed")
+
+        def close(self):
+            closed.set()
+
+    monkeypatch.setattr(llm.http.client, "HTTPConnection", Connection)
+    event = threading.Event()
+    model = web.OpenAICompatibleModel("http://127.0.0.1:11434/v1", "qwen3.8:27b",
+                                      cancel_event=event)
+    outcome = []
+    worker = threading.Thread(target=lambda: _capture_cancel(model, outcome))
+    worker.start()
+    assert entered.wait(3)
+    model.cancel()
+    worker.join(3)
+    assert not worker.is_alive() and outcome == [RequestCancelled]
+
+
+def _capture_cancel(model, outcome):
+    try:
+        model.complete("system", "user", 0.1)
+    except Exception as exc:
+        outcome.append(type(exc))

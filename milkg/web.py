@@ -11,7 +11,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +27,7 @@ from .augmentation import materialize_specifications
 from .documents import Chunk, load_chunks
 from .extraction import extract_chunk
 from .graph import MilitaryGraph
-from .llm import ChatModel, OpenAICompatibleModel, is_local_endpoint
+from .llm import ChatModel, OpenAICompatibleModel, RequestCancelled, is_local_endpoint
 from .neo4j_store import Neo4jGraphStore, document_rows
 from .qa import QUESTION_TYPES, export_sft, generate_qa
 from .traversal import atomic_facts, traverse
@@ -175,6 +175,9 @@ class Job:
     updated_at: str = field(default_factory=_now)
     log_count: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    active_model: ChatModel | None = field(default=None, repr=False)
+    future: Future | None = field(default=None, repr=False)
 
     def note(self, message: str, level: str = "info", stage: str | None = None,
              progress: int | None = None, current: int | None = None,
@@ -206,7 +209,7 @@ class Job:
             return {"id": self.id, "filename": self.filename,
                     "sources": list(self.source_names), "file_count": len(self.source_paths),
                     "status": self.status,
-                    "resumable": self.status == "failed" and self.graph_id is None
+                    "resumable": self.status in {"failed", "cancelled"} and self.graph_id is None
                     and self.total > 0 and self.current < self.total
                     and (self.output_dir / "chunks.json").exists()
                     and not (self.output_dir / "graph.json").exists(),
@@ -232,6 +235,10 @@ class CheckedModel:
         self.job = job
 
     def complete(self, system: str, user: str, temperature: float) -> dict:
+        with self.job.lock:
+            if self.job.cancel_event.is_set():
+                raise RequestCancelled()
+            self.job.active_model = self.client
         done = threading.Event()
         started = time.monotonic()
 
@@ -244,10 +251,20 @@ class CheckedModel:
                                    daemon=True)
         watcher.start()
         try:
-            return self.client.complete(system, user, temperature)
+            result = self.client.complete(system, user, temperature)
+            if self.job.cancel_event.is_set():
+                raise RequestCancelled()
+            return result
+        except Exception as exc:
+            if self.job.cancel_event.is_set():
+                raise RequestCancelled() from exc
+            raise
         finally:
             done.set()
             watcher.join()
+            with self.job.lock:
+                if self.job.active_model is self.client:
+                    self.job.active_model = None
 
 
 def _log_line(job_id: str, entry: dict) -> str:
@@ -294,8 +311,28 @@ class JobManager:
         with self.lock:
             self.jobs[job_id] = job
         if start:
-            self.executor.submit(self.run, job, api_key, neo4j_password)
+            job.future = self.executor.submit(self.run, job, api_key, neo4j_password)
         return job
+
+    def cancel(self, job: Job) -> None:
+        with job.lock:
+            if job.status == "cancelling":
+                return
+            if job.status not in {"queued", "running"}:
+                raise HTTPException(status_code=409, detail="该任务已结束，无法中断")
+            job.cancel_event.set()
+            job.status = "cancelling"
+            active_model = job.active_model
+            future = job.future
+        job.note("已收到中断请求，正在停止当前步骤。", stage="cancelling")
+        if future is not None and future.cancel():
+            with job.lock:
+                job.status = "cancelled"
+            job.note("任务已中断。", stage="cancelled")
+        elif active_model is not None:
+            stop = getattr(active_model, "cancel", None)
+            if callable(stop):
+                stop()
 
     def resume(self, job: Job, api_key: str, neo4j_password: str = "",
                local_thinking: bool | None = None,
@@ -318,9 +355,10 @@ class JobManager:
                     _write_json(job.output_dir / "config.json", settings.model_dump())
             job.status = "queued"
             job.error = None
+            job.cancel_event.clear()
         job.note(f"继续抽取任务已提交，将跳过前 {job.current} 个已完成片段。",
                  stage="queued")
-        self.executor.submit(self.run, job, api_key, neo4j_password, True)
+        job.future = self.executor.submit(self.run, job, api_key, neo4j_password, True)
 
     def get(self, job_id: str) -> Job:
         with self.lock:
@@ -349,7 +387,7 @@ class JobManager:
                     state = json.loads(state_path.read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     continue
-                if state.get("status") in {"queued", "running"}:
+                if state.get("status") in {"queued", "running", "cancelling"}:
                     state["status"] = "failed"
                     state["stage"] = "failed"
             summaries.append({key: state.get(key) for key in
@@ -400,13 +438,14 @@ class JobManager:
             completed = state.get("status") == "completed" and (
                 (output_dir / "graph.json").exists() if config.mode == "build" else
                 all((output_dir / f"sft_{fmt}.json").exists() for fmt in FORMATS))
-            job.status = "completed" if completed else "failed"
-            job.stage = "completed" if completed else "failed"
+            cancelled = not completed and state.get("status") == "cancelled"
+            job.status = "completed" if completed else "cancelled" if cancelled else "failed"
+            job.stage = job.status
             job.progress = 100 if completed else state.get("progress", 0)
             job.current = len(items) if completed else state.get("current", 0)
             job.total = len(items) if completed else state.get("total", 0)
-            job.error = None if completed else (state.get("error") if state.get("status") == "failed"
-                                                 else "任务因服务重启而中断，请重新提交。")
+            job.error = None if completed or cancelled else (state.get("error") if state.get("status") == "failed"
+                                                              else "任务因服务重启而中断，请重新提交。")
             graph_path = output_dir / "graph.json"
             if graph_path.exists():
                 graph = MilitaryGraph.load(graph_path)
@@ -417,7 +456,7 @@ class JobManager:
                 subgraphs = json.loads(subgraphs_path.read_text(encoding="utf-8"))
                 job.semantic_subgraphs = sum(s["strategy"] != "atomic_fact" for s in subgraphs)
                 job.atomic_subgraphs = len(subgraphs) - job.semantic_subgraphs
-            if not completed and state.get("status") in {"queued", "running"}:
+            if not completed and state.get("status") in {"queued", "running", "cancelling"}:
                 job.note(job.error, level="error", stage="failed", progress=job.progress)
             return job
         except (OSError, ValueError, KeyError, TypeError):
@@ -430,7 +469,8 @@ class JobManager:
                                                    enable_thinking=None if local else False,
                                                    reasoning_effort=("none" if local and not config.local_thinking
                                                                      else None),
-                                                   max_tokens=config.local_max_tokens if local else None), job)
+                                                   max_tokens=config.local_max_tokens if local else None,
+                                                   cancel_event=job.cancel_event), job)
 
     def _neo4j(self, config: RunConfig, password: str) -> Neo4jGraphStore:
         return Neo4jGraphStore(config.neo4j_uri, config.neo4j_user,
@@ -441,15 +481,22 @@ class JobManager:
             resume_extractions: bool = False) -> None:
         config = job.config
         store = None
+        def check_cancelled() -> None:
+            if job.cancel_event.is_set():
+                raise RequestCancelled()
+
         try:
+            check_cancelled()
             with job.lock:
                 job.status = "running"
             job.note("任务开始，正在准备数据源与模型。",
                      stage="graph" if config.mode == "generate" else "reading", progress=1)
             if config.storage == "neo4j":
                 store = self._neo4j(config, neo4j_password)
+            check_cancelled()
             if config.mode == "generate":
                 kg = store.load_graph(config.graph_id)
+                check_cancelled()
                 job.graph_id = config.graph_id
                 kg.save(job.output_dir / "graph.json")
                 _write_json(job.output_dir / "graph_ref.json",
@@ -486,6 +533,7 @@ class JobManager:
                 else:
                     extractions = []
                 for index, chunk in enumerate(chunks, 1):
+                    check_cancelled()
                     if index <= len(extractions):
                         continue
                     job.note(f"片段 {index}/{len(chunks)}（{chunk.source}）：正在抽取实体。", stage="extracting")
@@ -493,6 +541,7 @@ class JobManager:
                                            config.extract_temperature,
                                            on_phase=lambda message, i=index: job.note(
                                                f"片段 {i}/{len(chunks)}：{message}。", stage="extracting"))
+                    check_cancelled()
                     extractions.append(result)
                     _write_json(job.output_dir / "extractions.json", extractions)
                     percent = 8 + round(42 * index / len(chunks))
@@ -514,6 +563,7 @@ class JobManager:
                         job.note(f"片段 {index}/{len(chunks)} 的关系复查请求失败："
                                  f"{details['focused_pass_error']}；已保留首轮结果。",
                                  stage="extracting", level="warning")
+                check_cancelled()
                 if store:
                     if config.graph_action == "extend":
                         job.graph_id = config.graph_id
@@ -533,6 +583,7 @@ class JobManager:
                 if config.materialize_specs:
                     added = materialize_specifications(kg, chunks)
                     job.note(f"补充 {added} 条有原文证据的技术规格关系。", stage="graph", progress=60)
+                check_cancelled()
                 if store:
                     changes = store.save_graph(job.graph_id, kg, previous, document_rows(chunks))
                     _write_json(job.output_dir / "graph_ref.json",
@@ -542,11 +593,13 @@ class JobManager:
                              f"{changes['changed_nodes']} 个节点、{changes['changed_edges']} 条关系。",
                              stage="graph", progress=62)
                 kg.save(job.output_dir / "graph.json")
+            check_cancelled()
             with job.lock:
                 job.graph_nodes = kg.graph.number_of_nodes()
                 job.graph_edges = kg.graph.number_of_edges()
             if config.mode == "build":
                 with job.lock:
+                    check_cancelled()
                     job.status = "completed"
                 job.note(f"构图完成：{job.graph_nodes} 个节点、{job.graph_edges} 条关系。",
                          stage="completed", progress=100)
@@ -573,11 +626,13 @@ class JobManager:
                          f"仅找到 {semantic_count} 个语义子图。“最多语义子图”是上限，"
                          f"不会补齐缺少的关系。{hint}", level="warning", stage="traversing")
             if subgraphs:
+                check_cancelled()
                 generator = self._model(config, config.generate_model, api_key, job)
                 last_accepted = 0
 
                 def on_progress(items: list[dict], stats: dict) -> None:
                     nonlocal last_accepted
+                    check_cancelled()
                     with job.lock:
                         job.items = list(items)
                     _write_json(job.output_dir / "qa.json", items)
@@ -599,6 +654,7 @@ class JobManager:
                     config.per_subgraph, 0.85, on_progress=on_progress,
                     temperature=config.generate_temperature,
                 )
+                check_cancelled()
             else:
                 items, stats = [], {"attempted": 0, "accepted": 0, "invalid": 0,
                                     "duplicates": 0, "reason": "没有可用子图"}
@@ -610,12 +666,25 @@ class JobManager:
             _write_json(job.output_dir / "stats.json", stats)
             job.note("正在导出 SFT 数据集。", stage="exporting", progress=97)
             for fmt in sorted(FORMATS):
+                check_cancelled()
                 export_sft(items, job.output_dir / f"sft_{fmt}.json", fmt)
             with job.lock:
+                check_cancelled()
                 job.status = "completed"
             job.note(f"处理完成：{len(items)} 条问答通过校验，可预览和下载。",
                      stage="completed", progress=100, current=len(items), total=len(items))
+        except RequestCancelled:
+            with job.lock:
+                job.status = "cancelled"
+                job.error = None
+            job.note("任务已中断；已完成的片段和结果保留在任务目录。", stage="cancelled")
         except Exception as exc:
+            if job.cancel_event.is_set():
+                with job.lock:
+                    job.status = "cancelled"
+                    job.error = None
+                job.note("任务已中断；已完成的片段和结果保留在任务目录。", stage="cancelled")
+                return
             message = str(exc).replace(api_key, "[REDACTED]") if api_key else str(exc)
             if neo4j_password:
                 message = message.replace(neo4j_password, "[REDACTED]")
@@ -798,6 +867,13 @@ def recent_jobs(limit: int = 30) -> dict:
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
     return manager.get(job_id).snapshot()
+
+
+@app.post("/api/jobs/{job_id}/cancel", status_code=202)
+def cancel_job(job_id: str) -> dict:
+    job = manager.get(job_id)
+    manager.cancel(job)
+    return {"id": job.id, "status": job.status}
 
 
 @app.post("/api/jobs/{job_id}/resume", status_code=202)

@@ -5,6 +5,7 @@ const stageNames = {
   queued: '排队中', reading: '读取文档', extracting: '抽取实体关系',
   graph: '构建知识图谱', traversing: '遍历语义子图', generating: '生成问答',
   exporting: '导出数据集', completed: '处理完成', failed: '运行失败',
+  cancelling: '正在中断', cancelled: '已中断',
 }
 const typeNames = {
   single_choice: '单选', multiple_choice: '多选', cot: '推理',
@@ -51,6 +52,7 @@ const healthError = ref('')
 const job = ref(null)
 const requestError = ref('')
 const submitting = ref(false)
+const cancelling = ref(false)
 const items = ref([])
 const itemTotal = ref(0)
 const page = ref(0)
@@ -62,7 +64,7 @@ let timer = null
 let refreshingId = null
 
 const isBusy = computed(() => submitting.value || (!!job.value?.id && !job.value?.status) ||
-  ['queued', 'running'].includes(job.value?.status))
+  ['queued', 'running', 'cancelling'].includes(job.value?.status))
 const canStart = computed(() => (config.mode === 'generate' || selectedFiles.value.length > 0) && !!health.value?.ok &&
   !isBusy.value && (config.mode === 'build' || config.question_types.length > 0) &&
   (config.storage !== 'neo4j' || (config.graph_action === 'new' && config.mode !== 'generate') || !!config.graph_id))
@@ -261,7 +263,7 @@ async function refreshJob() {
       progress: snapshot.progress, updated_at: snapshot.updated_at })
     requestError.value = ''
     if (countChanged || snapshot.status === 'completed') await loadItems()
-    if (!['queued', 'running'].includes(snapshot.status)) stopPolling()
+    if (!['queued', 'running', 'cancelling'].includes(snapshot.status)) stopPolling()
     return true
   } catch (error) {
     if (job.value?.id !== id) return false
@@ -301,7 +303,7 @@ async function openJob(id) {
     config.local_thinking = !!job.value.local_thinking
     config.local_max_tokens = job.value.local_max_tokens || 4096
   }
-  if (job.value?.id === id && (!job.value.status || ['queued', 'running'].includes(job.value.status))) {
+  if (job.value?.id === id && (!job.value.status || ['queued', 'running', 'cancelling'].includes(job.value.status))) {
     startPolling(false)
   }
 }
@@ -358,6 +360,24 @@ async function resumeJob() {
     submitting.value = false
   }
 }
+async function cancelJob() {
+  if (!job.value?.id || !['queued', 'running'].includes(job.value.status) || cancelling.value) return
+  const id = job.value.id
+  cancelling.value = true
+  requestError.value = ''
+  try {
+    await api(`/api/jobs/${id}/cancel`, { method: 'POST' })
+    if (job.value?.id === id) {
+      job.value = { ...job.value, status: 'cancelling', stage: 'cancelling' }
+      startPolling()
+    }
+  } catch (error) {
+    requestError.value = error.message
+    await refreshJob()
+  } finally {
+    cancelling.value = false
+  }
+}
 function download(format = config.output_format) {
   if (job.value?.status !== 'completed') return
   window.location.href = `/api/jobs/${job.value.id}/download?format=${encodeURIComponent(format)}`
@@ -366,7 +386,8 @@ function downloadLog() {
   if (job.value?.id) window.location.href = `/api/jobs/${job.value.id}/logs`
 }
 function recentJobLabel(entry) {
-  const status = entry.status === 'completed' ? '完成' : entry.status === 'failed' ? '失败' : '运行中'
+  const status = entry.status === 'completed' ? '完成' : entry.status === 'failed' ? '失败'
+    : entry.status === 'cancelled' ? '已中断' : entry.status === 'cancelling' ? '中断中' : '运行中'
   return `${new Date(entry.updated_at || entry.created_at).toLocaleString('zh-CN')} · ${entry.filename || entry.id.slice(0, 8)} · ${status} ${entry.progress ?? 0}%`
 }
 function displayAnswer(answer) {
@@ -476,8 +497,8 @@ onUnmounted(stopPolling)
         </div>
 
         <div class="right-column">
-          <div class="panel progress-panel"><div class="panel-heading"><div><span class="section-no">02 / PROCESS</span><h2>运行进度</h2></div><span class="status-chip" :class="job?.status || 'idle'"><i></i>{{ job ? (job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : '运行中') : '等待开始' }}</span></div>
-            <div class="task-switcher"><label for="recent-job">近期任务</label><select id="recent-job" :value="job?.id || ''" @change="openJob($event.target.value)"><option value="">选择任务</option><option v-for="entry in recentJobs" :key="entry.id" :value="entry.id">{{ recentJobLabel(entry) }}</option></select><button type="button" :disabled="recentJobsLoading" @click="loadRecentJobs">{{ recentJobsLoading ? '读取中…' : '刷新' }}</button></div><p v-if="recentJobsError" class="task-switcher-error">{{ recentJobsError }}</p>
+          <div class="panel progress-panel"><div class="panel-heading"><div><span class="section-no">02 / PROCESS</span><h2>运行进度</h2></div><span class="status-chip" :class="job?.status || 'idle'"><i></i>{{ job ? (job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已中断' : job.status === 'cancelling' ? '正在中断' : '运行中') : '等待开始' }}</span></div>
+            <div class="task-switcher"><label for="recent-job">近期任务</label><select id="recent-job" :value="job?.id || ''" @change="openJob($event.target.value)"><option value="">选择任务</option><option v-for="entry in recentJobs" :key="entry.id" :value="entry.id">{{ recentJobLabel(entry) }}</option></select><button type="button" :disabled="recentJobsLoading" @click="loadRecentJobs">{{ recentJobsLoading ? '读取中…' : '刷新' }}</button><button v-if="['queued', 'running', 'cancelling'].includes(job?.status)" type="button" class="cancel-button" :disabled="cancelling || job?.status === 'cancelling'" @click="cancelJob">{{ job?.status === 'cancelling' ? '中断中…' : '中断任务' }}</button></div><p v-if="recentJobsError" class="task-switcher-error">{{ recentJobsError }}</p>
             <div class="progress-display"><div><span class="progress-caption">CURRENT STAGE</span><h3>{{ job ? stageNames[job.stage] || '处理中' : '准备就绪' }}</h3><p>{{ job?.status === 'failed' ? job.error : job ? `${job.filename || '文档'} · ${progressLabel}` : '上传文档并设置参数，开始构建数据集。' }}</p></div><div class="progress-number">{{ job?.progress ?? 0 }}<small>%</small></div></div>
             <div class="progress-track"><div :style="{ width: `${job?.progress ?? 0}%` }"></div></div>
             <div class="milestones"><div v-for="(name, index) in stageMilestones" :key="name" :class="{ reached: currentStageIndex >= index, active: currentStageIndex === index }"><i></i><span>{{ name }}</span></div></div>
@@ -485,7 +506,7 @@ onUnmounted(stopPolling)
           </div>
 
           <div class="panel log-panel"><div class="panel-heading"><div><span class="section-no">03 / ACTIVITY</span><h2>运行日志</h2></div><div class="log-actions"><span class="log-count">{{ job?.log_count ?? job?.logs?.length ?? 0 }} EVENTS</span><button type="button" :disabled="!job?.id" @click="downloadLog">下载完整日志</button></div></div>
-            <div class="terminal"><div class="terminal-bar"><span class="terminal-dots"><i></i><i></i><i></i></span><span>milkg / process.log</span><span>{{ ['queued', 'running'].includes(job?.status) ? '● LIVE' : '● SAVED' }}</span></div><div ref="logPanel" class="terminal-body"><div v-if="!job?.logs?.length" class="terminal-empty"><span>▍</span>等待任务启动，日志将显示在这里。</div><div v-for="(entry, index) in job?.logs || []" :key="index" class="log-line" :class="entry.level"><time>{{ timeOnly(entry.time) }}</time><span class="log-symbol">{{ entry.level === 'error' ? '×' : entry.level === 'warning' ? '!' : '›' }}</span><span>{{ entry.message }}</span></div></div></div>
+            <div class="terminal"><div class="terminal-bar"><span class="terminal-dots"><i></i><i></i><i></i></span><span>milkg / process.log</span><span>{{ ['queued', 'running', 'cancelling'].includes(job?.status) ? '● LIVE' : '● SAVED' }}</span></div><div ref="logPanel" class="terminal-body"><div v-if="!job?.logs?.length" class="terminal-empty"><span>▍</span>等待任务启动，日志将显示在这里。</div><div v-for="(entry, index) in job?.logs || []" :key="index" class="log-line" :class="entry.level"><time>{{ timeOnly(entry.time) }}</time><span class="log-symbol">{{ entry.level === 'error' ? '×' : entry.level === 'warning' ? '!' : '›' }}</span><span>{{ entry.message }}</span></div></div></div>
           </div>
         </div>
       </section>
