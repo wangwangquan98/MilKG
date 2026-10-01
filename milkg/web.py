@@ -604,8 +604,14 @@ class JobManager:
                 job.note(f"构图完成：{job.graph_nodes} 个节点、{job.graph_edges} 条关系。",
                          stage="completed", progress=100)
                 return
+            def traversal_progress(message: str) -> None:
+                check_cancelled()
+                job.note(message, stage="traversing", progress=63, current=0, total=0)
+
+            traversal_progress("开始遍历图谱，正在建立关系索引。")
             subgraphs = traverse(kg, max_subgraphs=config.max_subgraphs,
-                                 max_paths=max(2000, config.max_subgraphs))
+                                 max_paths=max(2000, config.max_subgraphs),
+                                 on_progress=traversal_progress)
             semantic_count = len(subgraphs)
             if config.include_atomic:
                 subgraphs.extend(atomic_facts(kg)[:config.max_atomic])
