@@ -96,9 +96,9 @@ class RunConfig(BaseModel):
     max_chars: int = Field(default=1800, ge=400, le=8000)
     overlap: int = Field(default=180, ge=0, le=1000)
     min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    max_subgraphs: int = Field(default=24, ge=1, le=200)
-    max_atomic: int = Field(default=24, ge=0, le=100)
-    per_subgraph: int = Field(default=1, ge=1, le=5)
+    max_subgraphs: int = Field(default=24, ge=1)
+    max_atomic: int = Field(default=24, ge=0)
+    per_subgraph: int = Field(default=1, ge=1)
     include_atomic: bool = True
     materialize_specs: bool = True
     question_types: list[str] = Field(default_factory=lambda: list(QUESTION_TYPES))
@@ -604,7 +604,8 @@ class JobManager:
                 job.note(f"构图完成：{job.graph_nodes} 个节点、{job.graph_edges} 条关系。",
                          stage="completed", progress=100)
                 return
-            subgraphs = traverse(kg, max_subgraphs=config.max_subgraphs)
+            subgraphs = traverse(kg, max_subgraphs=config.max_subgraphs,
+                                 max_paths=max(2000, config.max_subgraphs))
             semantic_count = len(subgraphs)
             if config.include_atomic:
                 subgraphs.extend(atomic_facts(kg)[:config.max_atomic])
